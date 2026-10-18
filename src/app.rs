@@ -4,13 +4,20 @@
 //! plain numbers (physical pixels), and the output is a [`FrameParams`] that any
 //! renderer backend can consume.
 
+use std::sync::Arc;
+
+use crate::bigfixed::{Fixed, frac_limbs_for_scale};
+use crate::perturb::{ReferenceOrbit, compute_reference};
+
 /// Which arithmetic the GPU kernel should use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Precision {
     /// Plain 32-bit floats. Fast; pixelates around 1e-5 zoom.
     F32,
-    /// Double-float (two f32s, ~48-bit mantissa). ~3-5x slower; good to ~1e-13.
+    /// Double-float (two f32s, ~48-bit mantissa). ~3-5x slower; good to ~1e-12.
     DoubleFloat,
+    /// f32 deltas against a high-precision CPU reference orbit; good to ~1e33.
+    Perturbation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,8 +27,9 @@ pub enum PrecisionMode {
 }
 
 /// Everything a renderer needs to draw one frame.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct FrameParams {
+    /// Center rounded to f64 (all the direct f32/df64 paths can use).
     pub center: (f64, f64),
     /// Complex-plane units per physical pixel.
     pub scale: f64,
@@ -30,8 +38,11 @@ pub struct FrameParams {
     pub max_iter: u32,
     pub palette: u32,
     pub precision: Precision,
-    /// Palette cycles per 100 iterations (before the log-ish remap in the shader).
+    /// Palette cycles per 50 iterations.
     pub color_density: f32,
+    /// Reference orbit at `center` (Perturbation only). Renderers can use
+    /// `Arc::ptr_eq` to skip re-uploading an unchanged orbit.
+    pub reference: Option<Arc<ReferenceOrbit>>,
 }
 
 pub const PALETTE_COUNT: u32 = 6;
@@ -41,13 +52,13 @@ pub const PALETTE_NAMES: [&str; PALETTE_COUNT as usize] =
 const HOME_CENTER: (f64, f64) = (-0.75, 0.0);
 /// Complex-plane height visible at zoom 1.
 const HOME_SPAN: f64 = 2.6;
-/// Beyond this the f64 center itself (and double-float) run out of bits.
-const MIN_SCALE: f64 = 1e-15;
-/// Switch to double-float once a pixel is smaller than this (Auto mode).
+/// Perturbation deltas are f32: stay clear of its smallest normal (1.2e-38).
+const MIN_SCALE: f64 = 1e-36;
+/// Switch away from plain f32 once a pixel is smaller than this (Auto mode).
 const F32_LIMIT: f64 = 2e-6;
 
 pub struct Explorer {
-    pub center: (f64, f64),
+    pub center: (Fixed, Fixed),
     pub scale: f64,
     pub width: u32,
     pub height: u32,
@@ -57,12 +68,14 @@ pub struct Explorer {
     pub color_density: f32,
     drag_anchor: Option<(f64, f64)>,
     pub cursor: (f64, f64),
+    /// (center, max_iter) the cached orbit was computed for.
+    reference: Option<((Fixed, Fixed), u32, Arc<ReferenceOrbit>)>,
 }
 
 impl Explorer {
     pub fn new(width: u32, height: u32) -> Self {
         let mut e = Self {
-            center: HOME_CENTER,
+            center: (Fixed::zero(2), Fixed::zero(2)),
             scale: 1.0,
             width: width.max(1),
             height: height.max(1),
@@ -72,6 +85,7 @@ impl Explorer {
             color_density: 1.0,
             drag_anchor: None,
             cursor: (0.0, 0.0),
+            reference: None,
         };
         e.reset_view();
         e
@@ -82,8 +96,16 @@ impl Explorer {
     }
 
     pub fn reset_view(&mut self) {
-        self.center = HOME_CENTER;
         self.scale = self.home_scale();
+        let frac = frac_limbs_for_scale(self.scale);
+        self.center = (Fixed::from_f64(HOME_CENTER.0, frac), Fixed::from_f64(HOME_CENTER.1, frac));
+    }
+
+    /// Set the center from decimal strings (arbitrary precision).
+    pub fn set_center_str(&mut self, x: &str, y: &str) -> Option<()> {
+        let frac = 8; // 512 bits: plenty for any MIN_SCALE
+        self.center = (Fixed::parse(x, frac)?, Fixed::parse(y, frac)?);
+        Some(())
     }
 
     /// Keeps the visible region stable (by height) when the window resizes.
@@ -102,16 +124,18 @@ impl Explorer {
     pub fn precision(&self) -> Precision {
         match self.precision_mode {
             PrecisionMode::Forced(p) => p,
-            PrecisionMode::Auto if self.scale < F32_LIMIT => Precision::DoubleFloat,
+            PrecisionMode::Auto if self.scale < F32_LIMIT => Precision::Perturbation,
             PrecisionMode::Auto => Precision::F32,
         }
     }
 
     pub fn cycle_precision_mode(&mut self) {
+        use Precision::*;
         self.precision_mode = match self.precision_mode {
-            PrecisionMode::Auto => PrecisionMode::Forced(Precision::F32),
-            PrecisionMode::Forced(Precision::F32) => PrecisionMode::Forced(Precision::DoubleFloat),
-            PrecisionMode::Forced(Precision::DoubleFloat) => PrecisionMode::Auto,
+            PrecisionMode::Auto => PrecisionMode::Forced(F32),
+            PrecisionMode::Forced(F32) => PrecisionMode::Forced(DoubleFloat),
+            PrecisionMode::Forced(DoubleFloat) => PrecisionMode::Forced(Perturbation),
+            PrecisionMode::Forced(Perturbation) => PrecisionMode::Auto,
         };
     }
 
@@ -122,21 +146,24 @@ impl Explorer {
         (base * self.iter_multiplier).clamp(32.0, 50_000.0) as u32
     }
 
-    fn pixel_to_complex(&self, px: f64, py: f64) -> (f64, f64) {
-        (
-            self.center.0 + (px - self.width as f64 / 2.0) * self.scale,
-            self.center.1 - (py - self.height as f64 / 2.0) * self.scale,
-        )
+    /// Move the center by a complex-plane offset, growing precision as needed.
+    fn shift_center(&mut self, dx: f64, dy: f64) {
+        let frac = frac_limbs_for_scale(self.scale).max(self.center.0.frac_limbs());
+        self.center = (
+            self.center.0.with_frac_limbs(frac).add_f64(dx),
+            self.center.1.with_frac_limbs(frac).add_f64(dy),
+        );
     }
 
     /// Zoom by `factor` (>1 zooms in) keeping the point under (px, py) fixed.
     pub fn zoom_at(&mut self, px: f64, py: f64, factor: f64) {
-        let anchor = self.pixel_to_complex(px, py);
+        // Offset of the anchor from the center, in complex units (small: f64 is fine).
+        let ox = (px - self.width as f64 / 2.0) * self.scale;
+        let oy = -(py - self.height as f64 / 2.0) * self.scale;
         let new_scale = (self.scale / factor).clamp(MIN_SCALE, self.home_scale() * 4.0);
         let k = new_scale / self.scale;
-        self.center.0 = anchor.0 + (self.center.0 - anchor.0) * k;
-        self.center.1 = anchor.1 + (self.center.1 - anchor.1) * k;
         self.scale = new_scale;
+        self.shift_center(ox * (1.0 - k), oy * (1.0 - k));
     }
 
     pub fn zoom_at_cursor(&mut self, factor: f64) {
@@ -149,8 +176,7 @@ impl Explorer {
 
     /// Move the content by (dx, dy) physical pixels (content follows the finger).
     pub fn pan_pixels(&mut self, dx: f64, dy: f64) {
-        self.center.0 -= dx * self.scale;
-        self.center.1 += dy * self.scale;
+        self.shift_center(-dx * self.scale, dy * self.scale);
     }
 
     /// Pan by a fraction of the view size (keyboard arrows).
@@ -186,36 +212,66 @@ impl Explorer {
         };
     }
 
-    pub fn frame_params(&self) -> FrameParams {
+    /// The reference orbit for the current view, recomputed only on change.
+    fn reference_orbit(&mut self) -> Arc<ReferenceOrbit> {
+        let max_iter = self.max_iter();
+        if let Some((c, n, orbit)) = &self.reference {
+            if *c == self.center && *n == max_iter {
+                return orbit.clone();
+            }
+        }
+        let orbit = Arc::new(compute_reference(&self.center.0, &self.center.1, max_iter));
+        self.reference = Some((self.center.clone(), max_iter, orbit.clone()));
+        orbit
+    }
+
+    pub fn frame_params(&mut self) -> FrameParams {
+        let precision = self.precision();
         FrameParams {
-            center: self.center,
+            center: (self.center.0.to_f64(), self.center.1.to_f64()),
             scale: self.scale,
             width: self.width,
             height: self.height,
             max_iter: self.max_iter(),
             palette: self.palette,
-            precision: self.precision(),
+            precision,
             color_density: self.color_density,
+            reference: (precision == Precision::Perturbation).then(|| self.reference_orbit()),
         }
+    }
+
+    /// Center as decimal strings with enough digits to reproduce this view.
+    pub fn center_strings(&self) -> (String, String) {
+        let digits = ((-self.scale.log10()).ceil() as usize + 3).max(8);
+        (self.center.0.to_decimal(digits), self.center.1.to_decimal(digits))
     }
 
     pub fn hud(&self, gpu_ms: Option<f64>) -> String {
         let mode = match (self.precision_mode, self.precision()) {
             (PrecisionMode::Auto, Precision::F32) => "auto/f32",
             (PrecisionMode::Auto, Precision::DoubleFloat) => "auto/df64",
+            (PrecisionMode::Auto, Precision::Perturbation) => "auto/perturb",
             (PrecisionMode::Forced(Precision::F32), _) => "f32",
             (PrecisionMode::Forced(Precision::DoubleFloat), _) => "df64",
+            (PrecisionMode::Forced(Precision::Perturbation), _) => "perturb",
         };
-        let ms = gpu_ms.map_or(String::new(), |ms| format!("  |  {ms:.1} ms"));
+        let reference = match (&self.reference, self.precision()) {
+            (Some((_, _, r)), Precision::Perturbation) => format!(
+                " (ref {}{} it, {:.0} ms)",
+                r.points.len() - 1,
+                if r.escaped { " escaped" } else { "" },
+                r.compute_ms
+            ),
+            _ => String::new(),
+        };
+        let ms = gpu_ms.map_or(String::new(), |ms| format!("  |  gpu {ms:.1} ms"));
+        // The title bar can't show 35 digits usefully; `c` prints them all.
+        let (cx, cy) = (self.center.0.to_f64(), self.center.1.to_f64());
         format!(
-            "Mandelbrot  |  {:+.15}, {:+.15}  |  zoom {:.3e}  |  iters {}  |  {}  |  {}{}",
-            self.center.0,
-            self.center.1,
+            "Mandelbrot  |  {cx:+.15}, {cy:+.15}  |  zoom {:.3e}  |  iters {}  |  {mode}{reference}  |  {}{ms}",
             self.zoom(),
             self.max_iter(),
-            mode,
             PALETTE_NAMES[self.palette as usize],
-            ms,
         )
     }
 }
@@ -224,14 +280,23 @@ impl Explorer {
 mod tests {
     use super::*;
 
+    fn pixel_to_complex(e: &Explorer, px: f64, py: f64) -> (Fixed, Fixed) {
+        (
+            e.center.0.add_f64((px - e.width as f64 / 2.0) * e.scale),
+            e.center.1.add_f64(-(py - e.height as f64 / 2.0) * e.scale),
+        )
+    }
+
     #[test]
     fn zoom_keeps_anchor_fixed() {
         let mut e = Explorer::new(800, 600);
-        let before = e.pixel_to_complex(123.0, 456.0);
+        e.zoom_at_center(1e20);
+        let before = pixel_to_complex(&e, 123.0, 456.0);
         e.zoom_at(123.0, 456.0, 7.5);
-        let after = e.pixel_to_complex(123.0, 456.0);
-        assert!((before.0 - after.0).abs() < 1e-12);
-        assert!((before.1 - after.1).abs() < 1e-12);
+        let after = pixel_to_complex(&e, 123.0, 456.0);
+        // Must hold to well below a pixel even at 1e20 zoom.
+        assert!((&before.0 - &after.0).to_f64().abs() < e.scale * 1e-3);
+        assert!((&before.1 - &after.1).to_f64().abs() < e.scale * 1e-3);
     }
 
     #[test]
@@ -239,6 +304,6 @@ mod tests {
         let mut e = Explorer::new(800, 600);
         assert_eq!(e.precision(), Precision::F32);
         e.zoom_at_center(1e6);
-        assert_eq!(e.precision(), Precision::DoubleFloat);
+        assert_eq!(e.precision(), Precision::Perturbation);
     }
 }

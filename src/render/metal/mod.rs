@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -13,9 +14,9 @@ use objc2_app_kit::NSView;
 use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLLibrary, MTLMathMode, MTLOrigin, MTLPixelFormat, MTLRegion, MTLSize, MTLStorageMode,
+    MTLLibrary, MTLMathMode, MTLOrigin, MTLPixelFormat, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode,
     MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
 use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
@@ -23,10 +24,12 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use super::{GpuParams, Renderer, Result};
 use crate::app::FrameParams;
+use crate::perturb::ReferenceOrbit;
 
 const SHADER_SOURCE: &str = include_str!("mandelbrot.metal");
 
 type Device = ProtocolObject<dyn MTLDevice>;
+type Buffer = ProtocolObject<dyn MTLBuffer>;
 
 pub struct MetalRenderer {
     device: Retained<Device>,
@@ -34,6 +37,10 @@ pub struct MetalRenderer {
     pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     /// None for headless (capture-only) renderers.
     layer: Option<Retained<CAMetalLayer>>,
+    /// Reference orbit for perturbation, uploaded only when the Arc changes.
+    reference: Option<(Arc<ReferenceOrbit>, Retained<Buffer>)>,
+    /// Bound at buffer(1) when there is no reference, to keep validation happy.
+    empty_buffer: Retained<Buffer>,
 }
 
 impl MetalRenderer {
@@ -42,20 +49,37 @@ impl MetalRenderer {
         let queue = device.newCommandQueue().ok_or("failed to create command queue")?;
         let pipeline = build_pipeline(&device)?;
         let layer = window.map(|w| attach_layer(w, &device)).transpose()?;
-        Ok(Self { device, queue, pipeline, layer })
+        let empty_buffer = new_buffer(&device, &[[0f32; 2]])?;
+        Ok(Self { device, queue, pipeline, layer, reference: None, empty_buffer })
+    }
+
+    fn reference_buffer(&mut self, params: &FrameParams) -> Result<Retained<Buffer>> {
+        let Some(orbit) = &params.reference else {
+            return Ok(self.empty_buffer.clone());
+        };
+        if let Some((cached, buffer)) = &self.reference {
+            if Arc::ptr_eq(cached, orbit) {
+                return Ok(buffer.clone());
+            }
+        }
+        let buffer = new_buffer(&self.device, &orbit.points)?;
+        self.reference = Some((orbit.clone(), buffer.clone()));
+        Ok(buffer)
     }
 
     fn encode(
-        &self,
+        &mut self,
         cmd: &ProtocolObject<dyn MTLCommandBuffer>,
         target: &ProtocolObject<dyn MTLTexture>,
         params: &FrameParams,
     ) -> Result<()> {
         let gpu = GpuParams::from(params);
+        let reference = self.reference_buffer(params)?;
         let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
         enc.setComputePipelineState(&self.pipeline);
-        // SAFETY: texture index 0 / buffer index 0 match the kernel signature,
-        // and setBytes copies `gpu` before returning.
+        // SAFETY: texture 0 / buffers 0 and 1 match the kernel signature,
+        // setBytes copies `gpu` before returning, and the kernel reads at most
+        // `ref_len` points from the reference buffer.
         unsafe {
             enc.setTexture_atIndex(Some(target), 0);
             enc.setBytes_length_atIndex(
@@ -63,6 +87,7 @@ impl MetalRenderer {
                 size_of::<GpuParams>(),
                 0,
             );
+            enc.setBuffer_offset_atIndex(Some(&reference), 0, 1);
         }
         let w = self.pipeline.threadExecutionWidth();
         let h = (self.pipeline.maxTotalThreadsPerThreadgroup() / w).max(1);
@@ -90,7 +115,7 @@ impl Renderer for MetalRenderer {
         };
         let texture = drawable.texture();
         // The layer may lag a resize by a frame; never dispatch past the texture.
-        let mut params = *params;
+        let mut params = params.clone();
         params.width = params.width.min(texture.width() as u32);
         params.height = params.height.min(texture.height() as u32);
 
@@ -146,6 +171,20 @@ impl Renderer for MetalRenderer {
         }
         Ok(pixels)
     }
+}
+
+/// Copy a slice of plain data into a new shared-memory Metal buffer.
+fn new_buffer<T: Copy>(device: &Device, data: &[T]) -> Result<Retained<Buffer>> {
+    let len = size_of_val(data).max(1);
+    // SAFETY: `data` is valid for `len` bytes (Metal copies it immediately).
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::new(data.as_ptr() as *mut c_void).unwrap(),
+            len,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or_else(|| "failed to allocate Metal buffer".into())
 }
 
 fn build_pipeline(device: &Device) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {

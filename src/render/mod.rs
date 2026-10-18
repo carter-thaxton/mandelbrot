@@ -50,8 +50,8 @@ pub fn create_headless() -> Result<Box<dyn Renderer>> {
 }
 
 /// Uniform block shared with the GPU kernel. Layout must match `Params` in the
-/// shader. Doubles are split into hi/lo f32 pairs since Apple GPUs (and WGSL)
-/// have no f64.
+/// shader (including its 8-byte alignment, hence `_pad`). Doubles are split
+/// into hi/lo f32 pairs since Apple GPUs (and WGSL) have no f64.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuParams {
@@ -64,6 +64,9 @@ pub struct GpuParams {
     pub palette: u32,
     pub precision: u32,
     pub color_density: f32,
+    /// Number of reference orbit points bound at buffer(1) (Perturbation).
+    pub ref_len: u32,
+    pub _pad: u32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -85,8 +88,11 @@ impl From<&FrameParams> for GpuParams {
             precision: match p.precision {
                 Precision::F32 => 0,
                 Precision::DoubleFloat => 1,
+                Precision::Perturbation => 2,
             },
             color_density: p.color_density,
+            ref_len: p.reference.as_ref().map_or(0, |r| r.points.len() as u32),
+            _pad: 0,
         }
     }
 }

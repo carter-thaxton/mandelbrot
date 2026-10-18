@@ -1,9 +1,10 @@
 // Mandelbrot compute kernel.
 //
 // Writes straight into the target texture (the CAMetalLayer drawable, or an
-// offscreen texture for captures). Two arithmetic paths:
+// offscreen texture for captures). Three arithmetic paths:
 //   precision == 0 : plain f32
 //   precision == 1 : double-float ("df64"), each value is an (hi, lo) f32 pair
+//   precision == 2 : perturbation against a CPU reference orbit (buffer 1)
 //
 // The df64 routines rely on exact IEEE rounding, so this library must be
 // compiled with MTLMathModeSafe (no fast-math reassociation).
@@ -22,6 +23,8 @@ struct Params {
     uint   palette;
     uint   precision;
     float  color_density;
+    uint   ref_len;
+    uint   _pad;
 };
 
 constant float BAILOUT2 = 65536.0; // |z| > 256: large radius for smooth coloring
@@ -136,6 +139,41 @@ float iterate_df(df cx, df cy, uint max_iter, float period_eps) {
     return -1.0;
 }
 
+// Perturbation with rebasing (Zhuoran, 2021).
+//
+// The reference orbit Z (computed on the CPU at high precision for the view
+// center C) is followed by index m; this pixel tracks only dz = z - Z_m, where
+// its c = C + dc:
+//
+//     dz <- (2 Z_m + dz) * dz + dc
+//
+// Rebasing: if the pixel's actual z = Z_m + dz becomes smaller than dz, the
+// reference is a poor guide here (dz would suffer catastrophic cancellation).
+// So restart against the *beginning* of the reference: dz = z, m = 0. Z_0 = 0,
+// so this is exact. Same when the reference orbit runs out (it escaped, or hit
+// max_iter). With rebasing a single reference serves the whole image, with no
+// glitch detection or secondary references.
+float iterate_perturb(float2 dc, device const float2* ref, uint ref_len, uint max_iter) {
+    float2 dz = float2(0.0);
+    uint m = 0;
+    for (uint n = 0; n < max_iter; ++n) {
+        float2 t = 2.0 * ref[m] + dz;
+        dz = float2(t.x * dz.x - t.y * dz.y, t.x * dz.y + t.y * dz.x) + dc;
+        ++m;
+
+        float2 z = ref[m] + dz;
+        float r2 = dot(z, z);
+        if (r2 > BAILOUT2) return smooth_mu(n, r2);
+
+        // L1 norms: squares of ~1e-30 deltas would underflow f32.
+        if (abs(z.x) + abs(z.y) < abs(dz.x) + abs(dz.y) || m >= ref_len - 1) {
+            dz = z;
+            m = 0;
+        }
+    }
+    return -1.0;
+}
+
 // ---------------------------------------------------------------------------
 // Coloring
 // ---------------------------------------------------------------------------
@@ -187,6 +225,7 @@ float3 palette(uint which, float t) {
 
 kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
+                       device const float2* ref           [[buffer(1)]],
                        uint2 gid                          [[thread_position_in_grid]])
 {
     if (gid.x >= p.width || gid.y >= p.height) return;
@@ -203,10 +242,14 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         float2 c = float2(p.center_x.x + px * p.scale.x,
                           p.center_y.x + py * p.scale.x);
         mu = iterate_f32(c, p.max_iter, max(period_eps, 1e-7));
-    } else {
+    } else if (p.precision == 1) {
         df cx = df_add(p.center_x, df_mul_f(p.scale, px));
         df cy = df_add(p.center_y, df_mul_f(p.scale, py));
         mu = iterate_df(cx, cy, p.max_iter, period_eps);
+    } else {
+        // The reference is the view center, so dc is just the pixel offset.
+        float2 dc = float2(px, py) * p.scale.x;
+        mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, p.max_iter) : -1.0;
     }
 
     float3 rgb = float3(0.0);

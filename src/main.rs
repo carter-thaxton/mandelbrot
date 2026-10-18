@@ -1,4 +1,6 @@
 mod app;
+mod bigfixed;
+mod perturb;
 mod render;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,12 +24,14 @@ Mandelbrot explorer
   [ / ]                      fewer / more iterations
   , / .                      color density down / up
   p / shift+p                next / previous palette
-  m                          precision: auto -> f32 -> df64
+  m                          precision: auto -> f32 -> df64 -> perturb
   r                          reset view
   s                          save screenshot (PNG in current dir)
+  c                          print location (full precision) as a --capture command
   esc / q                    quit
 
-Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--precision f32|df]";
+Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--iters N]
+          [--density D] [--precision f32|df|perturb]";
 
 struct App {
     window: Option<Window>,
@@ -79,6 +83,11 @@ impl App {
                     e.color_density = 1.0;
                 }
                 "s" | "S" => self.save_screenshot(),
+                "c" | "C" => {
+                    let (x, y) = e.center_strings();
+                    println!("--center {x},{y} --zoom {:.6e}", e.zoom());
+                    return;
+                }
                 _ => return,
             },
             _ => return,
@@ -203,13 +212,15 @@ fn write_png(path: &str, params: &app::FrameParams, rgba: &[u8]) -> render::Resu
     writer.write_image_data(rgba).map_err(|e| e.to_string())
 }
 
-/// `--capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--precision f32|df]`
+/// `--capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--iters N] [--density D] [--precision ...]`
 fn run_capture(args: &[String]) -> render::Result<()> {
     let mut path = None;
     let (mut w, mut h) = (1600u32, 1000u32);
-    let mut center = None;
+    let mut center: Option<(String, String)> = None;
     let mut zoom = 1.0f64;
     let mut precision = PrecisionMode::Auto;
+    let mut iters: Option<f64> = None;
+    let mut density = 1.0f32;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{arg} needs a value"));
@@ -224,16 +235,16 @@ fn run_capture(args: &[String]) -> render::Result<()> {
             "--center" => {
                 let v = val()?;
                 let (a, b) = v.split_once(',').ok_or("center must be X,Y")?;
-                center = Some((
-                    a.parse::<f64>().map_err(|_| "bad center x")?,
-                    b.parse::<f64>().map_err(|_| "bad center y")?,
-                ));
+                center = Some((a.to_string(), b.to_string()));
             }
             "--zoom" => zoom = val()?.parse().map_err(|_| "bad zoom")?,
+            "--iters" => iters = Some(val()?.parse().map_err(|_| "bad iters")?),
+            "--density" => density = val()?.parse().map_err(|_| "bad density")?,
             "--precision" => {
                 precision = match val()?.as_str() {
                     "f32" => PrecisionMode::Forced(Precision::F32),
                     "df" | "df64" => PrecisionMode::Forced(Precision::DoubleFloat),
+                    "perturb" | "pt" => PrecisionMode::Forced(Precision::Perturbation),
                     _ => PrecisionMode::Auto,
                 }
             }
@@ -244,10 +255,14 @@ fn run_capture(args: &[String]) -> render::Result<()> {
 
     let mut explorer = Explorer::new(w, h);
     explorer.precision_mode = precision;
-    if let Some(c) = center {
-        explorer.center = c;
+    if let Some((x, y)) = center {
+        explorer.set_center_str(&x, &y).ok_or("bad center")?;
     }
     explorer.zoom_at_center(zoom);
+    explorer.color_density = density;
+    if let Some(n) = iters {
+        explorer.iter_multiplier = n / explorer.max_iter() as f64;
+    }
 
     let mut renderer = render::create_headless()?;
     let params = explorer.frame_params();
