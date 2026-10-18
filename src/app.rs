@@ -70,7 +70,17 @@ const MIN_SCALE: f64 = 1e-300;
 const F32_LIMIT: f64 = 2e-6;
 
 pub const MIN_ITER: u32 = 256;
+/// Automatic iteration decisions need at least this many samples: the 0.1%
+/// cut-off test is meaningless on a few thousand (it fired on 8 pixels).
+pub const MIN_DECISION_SAMPLES: u64 = 20_000;
 pub const MAX_ITER: u32 = 200_000;
+
+/// In auto mode, each zoom by a factor f scales the iteration limit by
+/// f^ITERS_PER_ZOOM, so it keeps roughly in step while zooming; GPU
+/// statistics then correct it for the actual location. Fitted to the seahorse
+/// valley (5.4k needed at 1e10, 62k at 1e30); flatter places just get
+/// corrected down.
+const ITERS_PER_ZOOM: f64 = 0.04;
 
 /// A reference may be used while within this many view sizes of the center;
 /// beyond it, f32 deltas lose too much precision and we recompute in place.
@@ -109,6 +119,9 @@ pub struct Explorer {
     pub auto_iter: bool,
     /// Use the series approximation to skip early iterations (Perturbation).
     pub series_skip: bool,
+    /// Zoom-driven change to `iter_limit` not yet applied (applied in >=5%
+    /// steps so continuous zooming doesn't change it every frame).
+    iter_drift: f64,
     drag_anchor: Option<(f64, f64)>,
     pub cursor: (f64, f64),
     /// Sub-pixel pan not yet applied: pans move the center in whole pixels so
@@ -134,6 +147,7 @@ impl Explorer {
             iter_limit: MIN_ITER,
             auto_iter: true,
             series_skip: true,
+            iter_drift: 1.0,
             drag_anchor: None,
             cursor: (0.0, 0.0),
             pan_remainder: (0.0, 0.0),
@@ -225,13 +239,13 @@ impl Explorer {
     ///   the top half, overshoots 2x when escape counts cluster just below the
     ///   limit. Counting against all samples instead of escaped ones stalls
     ///   when most of the view is still black.)
-    /// - If even the slowest escaping sample used less than a quarter of the
+    /// - If even the slowest escaping sample used less than a third of the
     ///   limit, the extra iterations only cost time on interior pixels: shrink
-    ///   to 3x that sample. That leaves the top quarter empty, so the two
+    ///   to 2x that sample. That leaves the top quarter empty, so the two
     ///   rules don't oscillate. Only applied when `whole_view` (a strip
     ///   revealed by panning says nothing about the rest of the image).
     pub fn observe(&mut self, s: &FrameStats, whole_view: bool) -> bool {
-        if !self.auto_iter || s.samples == 0 {
+        if !self.auto_iter || s.samples < MIN_DECISION_SAMPLES {
             return false;
         }
         let l = self.iter_limit;
@@ -240,8 +254,8 @@ impl Explorer {
         let all_black = s.max_escaped == 0 && s.interior > 0;
         let new = if cut_off || all_black {
             l.saturating_mul(2)
-        } else if whole_view && s.max_escaped < l / 4 {
-            s.max_escaped.saturating_mul(3)
+        } else if whole_view && s.max_escaped < l / 3 {
+            s.max_escaped.saturating_mul(2)
         } else {
             l
         }
@@ -269,6 +283,14 @@ impl Explorer {
         let k = new_scale / self.scale;
         self.scale = new_scale;
         self.pan_remainder = (0.0, 0.0);
+        if self.auto_iter {
+            self.iter_drift *= k.recip().powf(ITERS_PER_ZOOM);
+            if !(1.0 / 1.05..=1.05).contains(&self.iter_drift) {
+                let n = self.iter_limit as f64 * self.iter_drift;
+                self.iter_limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
+                self.iter_drift = 1.0;
+            }
+        }
         self.shift_center(ox * (1.0 - k), oy * (1.0 - k));
     }
 
@@ -510,14 +532,31 @@ mod tests {
         assert!(e.observe(&stats(100_000, 1990, 50, 99_900), true));
         assert_eq!(e.iter_limit, 4000);
         e.iter_limit = 2000;
-        // Same over the whole view: shrink to 3x it.
+        // Same over the whole view: shrink to 2x it.
         assert!(e.observe(&stats(100_000, 300, 0, 20_000), true));
-        assert_eq!(e.iter_limit, 900);
+        assert_eq!(e.iter_limit, 600);
         // Same frame again: stable.
         assert!(!e.observe(&stats(100_000, 300, 0, 20_000), true));
         // Manual mode ignores stats.
         e.scale_iter_limit(2.0);
         assert!(!e.observe(&stats(100_000, 1, 0, 0), true));
+    }
+
+    #[test]
+    fn iterations_track_zoom_depth() {
+        let mut e = Explorer::new(800, 600);
+        e.iter_limit = 1000;
+        // 1e5 zoom in many small steps, like a pinch.
+        for _ in 0..100 {
+            e.zoom_at_center(1e5f64.powf(0.01));
+        }
+        let expected = 1000.0 * 1e5f64.powf(ITERS_PER_ZOOM);
+        let got = e.iter_limit as f64;
+        assert!((got / expected - 1.0).abs() < 0.06, "{got} vs {expected}");
+        // Manual mode leaves it alone.
+        e.set_iter_limit(500);
+        e.zoom_at_center(1e5);
+        assert_eq!(e.iter_limit, 500);
     }
 
     #[test]

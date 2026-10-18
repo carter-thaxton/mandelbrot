@@ -125,7 +125,7 @@ impl MetalRenderer {
         if batch.tiles.is_empty() {
             return Ok(0);
         }
-        let gpu = GpuParams::new(params, batch.step);
+        let gpu = GpuParams { stats_only: batch.stats_only as u32, ..GpuParams::new(params, batch.step) };
         let per_side = (TILE / gpu.step) as usize;
         let reference = self.reference_buffer(params)?;
         // SAFETY: the buffer was created with room for one GpuStats, and the
@@ -438,6 +438,45 @@ mod tests {
             }
         }
         panic!("scheduler never finished");
+    }
+
+    /// Simulated continuous pinch-zoom through the seahorse valley, printing
+    /// the iteration limit along the way. A measurement, not a pass/fail test:
+    /// `cargo test --release simulated_deep_zoom -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn simulated_deep_zoom() {
+        let (w, h) = (1200, 800);
+        let mut r = MetalRenderer::new(None::<&crate::render::NoWindow>).unwrap();
+        r.resize(w, h, 1.0);
+        let mut e = Explorer::new(w, h);
+        e.set_center_str("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
+        e.zoom_at_center(1e10);
+        e.iter_limit = e.estimate_iter();
+        let mut s = Scheduler::default();
+        let start = std::time::Instant::now();
+        let mut next_report = 10.0;
+        while e.zoom() < 1e30 {
+            s.step(&mut e, &mut r).unwrap();
+            e.zoom_at_center(1.05);
+            let decade = e.zoom().log10();
+            if decade >= next_report {
+                println!("zoom 1e{decade:.0}: iters {:>6}  ({:.1} s)", e.iter_limit, start.elapsed().as_secs_f64());
+                next_report += 2.0;
+            }
+        }
+        // Then stop and let it settle.
+        let settle = std::time::Instant::now();
+        while s.step(&mut e, &mut r).unwrap() {}
+        println!("settled at 1e30: iters {} after {:.1} s", e.iter_limit, settle.elapsed().as_secs_f64());
+        println!("{}", e.hud(None, None));
+        let mut fresh = Explorer::new(w, h);
+        fresh.center = e.center.clone();
+        fresh.scale = e.scale;
+        fresh.set_iter_limit(e.iter_limit);
+        let p = fresh.frame_params();
+        let (_, st) = r.capture(&p, 1).unwrap();
+        println!("fresh reference: {:.0} ms  {}", st.gpu_ms, fresh.hud(None, None));
     }
 
     /// After panning (reusing exact tiles) or zooming (recomputing over a

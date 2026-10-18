@@ -19,18 +19,27 @@
 //! from a long zoom-in stays bounded), then the rest at full resolution,
 //! center outward.
 //!
-//! The automatic iteration limit is judged on whole-view statistics only:
-//! batches are accumulated into a *sweep* until every tile has been computed
-//! for the current view and look. A single batch is a biased sample (a few
-//! tiles along the set's boundary always look under-iterated), and acting on
-//! those would ratchet the limit upward.
+//! The automatic iteration limit is judged on whole-view statistics only. A
+//! single batch is a biased sample (a few tiles along the set's boundary
+//! always look under-iterated), and acting on those would ratchet the limit
+//! upward. Two sources:
+//!   - While the view is changing, a *probe* every PROBE_INTERVAL: one frame
+//!     spent on a coarse whole-view pass that gathers statistics but writes
+//!     no pixels. This keeps the limit current during continuous zooming and
+//!     panning, when tiles are mostly reused and no sweep would complete.
+//!   - A *sweep*: batches accumulated until every tile has been computed for
+//!     the current view and look (full-resolution evidence once settled).
 
-use crate::app::{Explorer, FrameParams, Precision};
+use crate::app::{Explorer, FrameParams, MIN_DECISION_SAMPLES, Precision};
 use crate::bigfixed::Fixed;
 use crate::render::{FrameStats, Renderer, Reprojection, Result, TILE, TileBatch};
 
 /// GPU time to aim for per frame (ms). Leaves headroom inside a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 12.0;
+/// Minimum time between statistics probes while the view keeps changing.
+const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
+/// Probes sample at least this coarsely (they only need statistics).
+const PROBE_MIN_STEP: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Tile {
@@ -170,12 +179,7 @@ impl Sweep {
 
     /// Add one batch; returns true once the whole view has been covered.
     fn add(&mut self, s: &FrameStats, tiles: &[usize]) -> bool {
-        let t = &mut self.stats;
-        t.gpu_ms += s.gpu_ms;
-        t.samples += s.samples;
-        t.max_escaped = t.max_escaped.max(s.max_escaped);
-        t.near_limit += s.near_limit;
-        t.interior += s.interior;
+        self.stats.merge(s);
         for &i in tiles {
             if !std::mem::replace(&mut self.swept[i], true) {
                 self.remaining -= 1;
@@ -194,6 +198,14 @@ pub struct Scheduler {
     ms_per_sample: f64,
     /// GPU time spent since the view last changed.
     work_ms: f64,
+    /// The view or look changed since the last statistics probe.
+    probe_due: bool,
+    last_probe: Option<std::time::Instant>,
+    /// Probe statistics accumulated until there are enough to decide on
+    /// (coarse probes of expensive views have only a few thousand samples).
+    probe_stats: FrameStats,
+    /// Override for PROBE_INTERVAL (tests).
+    probe_interval: Option<std::time::Duration>,
 }
 
 impl Scheduler {
@@ -266,15 +278,25 @@ impl Scheduler {
             }
             self.work_ms = 0.0;
             self.sweep = None;
+            self.probe_due = true;
             new
         } else {
             old
         };
         if canvas.look != look {
-            // Colors or iteration counts changed: everything needs redoing.
-            // Keep the old pixels on screen until the coarse pass replaces them.
-            canvas.tiles.fill(MISSING);
+            let only_iters = Look { max_iter: look.max_iter, ..canvas.look.clone() } == look;
+            let ratio = look.max_iter as f64 / canvas.look.max_iter as f64;
+            if only_iters && ratio > 0.5 && ratio < 2.0 {
+                // A modest iteration change barely alters the image: keep it
+                // as the preview and just refine.
+                canvas.tiles.iter_mut().for_each(|t| t.exact = false);
+            } else {
+                // Colors changed, or iterations by 2x or more: redo everything.
+                // Old pixels stay on screen until the coarse pass replaces them.
+                canvas.tiles.fill(MISSING);
+            }
             canvas.look = look;
+            self.probe_due = true;
             self.sweep = None;
             self.work_ms = 0.0;
         }
@@ -326,15 +348,44 @@ impl Scheduler {
         let params = explorer.frame_params();
         let moved = self.sync(explorer, &params, renderer)?;
 
+        if self.probe_due
+            && explorer.auto_iter
+            && self.last_probe.is_none_or(|t| t.elapsed() >= self.probe_interval.unwrap_or(PROBE_INTERVAL))
+        {
+            // Spend this frame on whole-view statistics (it still presents
+            // the canvas, including any reprojection just done).
+            let canvas = self.canvas.as_ref().unwrap();
+            let all = TileBatch::all(canvas.width, canvas.height, self.preview_step(&params).max(PROBE_MIN_STEP));
+            let stats = renderer.draw(&params, &TileBatch { stats_only: true, ..all })?;
+            self.record(&stats);
+            self.probe_stats.merge(&stats);
+            if self.probe_stats.samples >= MIN_DECISION_SAMPLES {
+                let before = explorer.iter_limit;
+                explorer.observe(&self.probe_stats, true);
+                if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
+                    eprintln!(
+                        "probe at zoom {:.2e}: limit {before} -> {}  {:?}",
+                        explorer.zoom(),
+                        explorer.iter_limit,
+                        self.probe_stats
+                    );
+                }
+                self.probe_stats = FrameStats::default();
+            }
+            self.probe_due = false;
+            self.last_probe = Some(std::time::Instant::now());
+            return Ok(true);
+        }
+
         let Some((tiles, step)) = self.pick(&params) else {
             if moved {
                 // Reprojection alone: still needs presenting.
-                renderer.draw(&params, &TileBatch { tiles: vec![], step: 1 })?;
+                renderer.draw(&params, &TileBatch { tiles: vec![], step: 1, stats_only: false })?;
             }
             return Ok(false);
         };
         let canvas = self.canvas.as_ref().unwrap();
-        let batch = TileBatch { tiles: tiles.iter().map(|&i| canvas.origin(i)).collect(), step };
+        let batch = TileBatch { tiles: tiles.iter().map(|&i| canvas.origin(i)).collect(), step, stats_only: false };
         let total = canvas.tiles.len();
 
         let stats = renderer.draw(&params, &batch)?;
@@ -347,7 +398,21 @@ impl Scheduler {
         // changed limit shows up as a new Look on the next step.
         let sweep = self.sweep.get_or_insert_with(|| Sweep::new(total));
         if sweep.add(&stats, &tiles) {
-            explorer.observe(&sweep.stats, true);
+            // Too few samples (a very coarse pass) means no decision; start a
+            // new sweep rather than topping this one up with partial batches,
+            // which would bias it.
+            if sweep.stats.samples >= MIN_DECISION_SAMPLES {
+                let before = explorer.iter_limit;
+                explorer.observe(&sweep.stats, true);
+                if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
+                    eprintln!(
+                        "sweep at zoom {:.2e}: limit {before} -> {}  {:?}",
+                        explorer.zoom(),
+                        explorer.iter_limit,
+                        sweep.stats
+                    );
+                }
+            }
             self.sweep = None;
         }
         Ok(true)
@@ -395,7 +460,7 @@ mod tests {
 
     /// Full-resolution tiles computed since `from`.
     fn exact_tiles(m: &Mock, from: usize) -> usize {
-        m.batches[from..].iter().filter(|b| b.step == 1).map(|b| b.tiles.len()).sum()
+        m.batches[from..].iter().filter(|b| b.step == 1 && !b.stats_only).map(|b| b.tiles.len()).sum()
     }
 
     #[test]
@@ -403,9 +468,9 @@ mod tests {
         let mut e = Explorer::new(400, 300);
         let (mut s, mut m) = (Scheduler::default(), Mock::default());
         run_to_completion(&mut s, &mut e, &mut m);
-        assert!(m.batches[0].step > 1, "first frame should be a coarse preview");
+        assert!(m.batches.iter().find(|b| !b.stats_only).unwrap().step > 1, "first work should be a coarse preview");
         let mut seen = std::collections::HashMap::new();
-        for b in m.batches.iter().filter(|b| b.step == 1) {
+        for b in m.batches.iter().filter(|b| b.step == 1 && !b.stats_only) {
             for t in &b.tiles {
                 *seen.entry(*t).or_insert(0) += 1;
             }
@@ -471,6 +536,46 @@ mod tests {
         assert_eq!(e.iter_limit, start * 2);
     }
 
+    /// A view that needs `needed` iterations: below that, half the samples
+    /// stay black and most escapes land near the limit.
+    struct Needs {
+        needed: u32,
+    }
+
+    impl Renderer for Needs {
+        fn resize(&mut self, _: u32, _: u32, _: f64) {}
+        fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
+            let samples = batch.tiles.len() as u64 * (TILE / batch.step).pow(2) as u64;
+            let (max_escaped, near_limit, interior) = if p.max_iter < self.needed {
+                (p.max_iter - 1, (samples / 4) as u32, (samples / 2) as u32)
+            } else {
+                (self.needed - 1, 0, 0)
+            };
+            Ok(FrameStats { gpu_ms: samples as f64 * 1e-4, samples, max_escaped, near_limit, interior })
+        }
+        fn reproject(&mut self, _: &Reprojection) -> Result<()> {
+            Ok(())
+        }
+        fn capture(&mut self, _: &FrameParams, _: u32) -> Result<(Vec<u8>, FrameStats)> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn limit_adapts_during_continuous_motion() {
+        let mut e = Explorer::new(400, 304);
+        let mut s = Scheduler { probe_interval: Some(std::time::Duration::ZERO), ..Default::default() };
+        let mut r = Needs { needed: 8000 };
+        let start = e.iter_limit;
+        // Pan a little every frame: no sweep ever completes.
+        for _ in 0..40 {
+            s.step(&mut e, &mut r).unwrap();
+            e.pan_pixels(3.0, 0.0);
+        }
+        assert!(e.iter_limit >= 8000, "limit stuck at {} (started at {start})", e.iter_limit);
+        assert!(e.iter_limit < 4 * 8000, "overshot to {}", e.iter_limit);
+    }
+
     #[test]
     fn zoom_reuses_old_image_as_preview() {
         let mut e = Explorer::new(400, 304);
@@ -486,7 +591,7 @@ mod tests {
         // So no coarse pass is needed: straight to full-resolution refinement.
         let before = m.batches.len();
         run_to_completion(&mut s, &mut e, &mut m);
-        assert!(m.batches[before..].iter().all(|b| b.step == 1));
+        assert!(m.batches[before..].iter().filter(|b| !b.stats_only).all(|b| b.step == 1));
 
         // Zoom out 2x: the middle quarter has sharp sources, the border none.
         e.zoom_at_center(0.5);

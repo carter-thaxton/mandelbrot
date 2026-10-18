@@ -31,6 +31,8 @@ pub struct TileBatch {
     /// Sample every `step` pixels and fill step x step blocks (1 = full res).
     /// A power of two no larger than [`TILE`].
     pub step: u32,
+    /// Only gather statistics; leave the canvas untouched.
+    pub stats_only: bool,
 }
 
 impl TileBatch {
@@ -39,7 +41,7 @@ impl TileBatch {
         let tiles = (0..height.div_ceil(TILE))
             .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| [tx * TILE, ty * TILE]))
             .collect();
-        Self { tiles, step }
+        Self { tiles, step, stats_only: false }
     }
 }
 
@@ -68,6 +70,17 @@ pub struct FrameStats {
     pub near_limit: u32,
     /// Samples that never escaped (in the set, or under-iterated).
     pub interior: u32,
+}
+
+impl FrameStats {
+    /// Combine statistics from several draws.
+    pub fn merge(&mut self, s: &FrameStats) {
+        self.gpu_ms += s.gpu_ms;
+        self.samples += s.samples;
+        self.max_escaped = self.max_escaped.max(s.max_escaped);
+        self.near_limit += s.near_limit;
+        self.interior += s.interior;
+    }
 }
 
 pub trait Renderer {
@@ -141,7 +154,8 @@ pub struct GpuParams {
     pub sa_n: u32,
     pub sa_a_m: [f32; 2],
     pub sa_a_e: i32,
-    pub _pad: u32,
+    /// Nonzero: compute statistics only, write no pixels.
+    pub stats_only: u32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -178,7 +192,7 @@ impl GpuParams {
             sa_n: p.series_n,
             sa_a_m: p.series_a.0,
             sa_a_e: p.series_a.1,
-            _pad: 0,
+            stats_only: 0,
         }
     }
 }

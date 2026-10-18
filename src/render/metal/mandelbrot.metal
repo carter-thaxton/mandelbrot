@@ -34,7 +34,7 @@ struct Params {
     uint   sa_n;       // series approximation: start at iteration sa_n...
     float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
     int    sa_a_e;
-    uint   _pad;
+    uint   stats_only; // nonzero: gather statistics, write no pixels
 };
 
 constant uint TILE = 16; // must match TILE in src/render/mod.rs
@@ -400,7 +400,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
             rgb = palette(p.palette, t);
         }
         uint x1 = min(x0 + p.step, p.width);
-        uint y1 = min(y0 + p.step, p.height);
+        uint y1 = p.stats_only ? y0 : min(y0 + p.step, p.height);
         for (uint y = y0; y < y1; ++y) {
             for (uint x = x0; x < x1; ++x) {
                 out.write(float4(rgb, 1.0), uint2(x, y));
