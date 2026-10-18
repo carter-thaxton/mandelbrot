@@ -49,7 +49,7 @@ impl MetalRenderer {
         let queue = device.newCommandQueue().ok_or("failed to create command queue")?;
         let pipeline = build_pipeline(&device)?;
         let layer = window.map(|w| attach_layer(w, &device)).transpose()?;
-        let empty_buffer = new_buffer(&device, &[[0f32; 2]])?;
+        let empty_buffer = new_buffer(&device, &[0u8; 64])?;
         Ok(Self { device, queue, pipeline, layer, reference: None, empty_buffer })
     }
 

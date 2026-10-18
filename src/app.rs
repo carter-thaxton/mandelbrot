@@ -16,7 +16,8 @@ pub enum Precision {
     F32,
     /// Double-float (two f32s, ~48-bit mantissa). ~3-5x slower; good to ~1e-12.
     DoubleFloat,
-    /// f32 deltas against a high-precision CPU reference orbit; good to ~1e33.
+    /// Deltas against a high-precision CPU reference orbit; f32 where possible,
+    /// floatexp where values are too small for f32. Good to ~1e300.
     Perturbation,
 }
 
@@ -52,8 +53,8 @@ pub const PALETTE_NAMES: [&str; PALETTE_COUNT as usize] =
 const HOME_CENTER: (f64, f64) = (-0.75, 0.0);
 /// Complex-plane height visible at zoom 1.
 const HOME_SPAN: f64 = 2.6;
-/// Perturbation deltas are f32: stay clear of its smallest normal (1.2e-38).
-const MIN_SCALE: f64 = 1e-36;
+/// The scale (and the reference orbit's conversion through f64) is f64.
+const MIN_SCALE: f64 = 1e-300;
 /// Switch away from plain f32 once a pixel is smaller than this (Auto mode).
 const F32_LIMIT: f64 = 2e-6;
 
@@ -103,7 +104,8 @@ impl Explorer {
 
     /// Set the center from decimal strings (arbitrary precision).
     pub fn set_center_str(&mut self, x: &str, y: &str) -> Option<()> {
-        let frac = 8; // 512 bits: plenty for any MIN_SCALE
+        // ~3.3 bits per decimal digit; keep everything that was typed.
+        let frac = (x.len().max(y.len()) * 4).div_ceil(64).max(8);
         self.center = (Fixed::parse(x, frac)?, Fixed::parse(y, frac)?);
         Some(())
     }

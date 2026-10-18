@@ -7,6 +7,7 @@
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::app::{FrameParams, Precision};
+use crate::perturb::frexp;
 
 #[cfg(target_os = "macos")]
 mod metal;
@@ -66,6 +67,9 @@ pub struct GpuParams {
     pub color_density: f32,
     /// Number of reference orbit points bound at buffer(1) (Perturbation).
     pub ref_len: u32,
+    /// Scale as floatexp (scale_m * 2^scale_e): below ~1e-38 it has no f32.
+    pub scale_m: f32,
+    pub scale_e: i32,
     pub _pad: u32,
 }
 
@@ -92,6 +96,8 @@ impl From<&FrameParams> for GpuParams {
             },
             color_density: p.color_density,
             ref_len: p.reference.as_ref().map_or(0, |r| r.points.len() as u32),
+            scale_m: frexp(p.scale).0 as f32,
+            scale_e: frexp(p.scale).1,
             _pad: 0,
         }
     }

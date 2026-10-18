@@ -24,6 +24,8 @@ struct Params {
     uint   precision;
     float  color_density;
     uint   ref_len;
+    float  scale_m;    // scale as floatexp: scale_m * 2^scale_e
+    int    scale_e;
     uint   _pad;
 };
 
@@ -139,6 +141,50 @@ float iterate_df(df cx, df cy, uint max_iter, float period_eps) {
     return -1.0;
 }
 
+// ---------------------------------------------------------------------------
+// Complex floatexp: value = m * 2^e, one exponent shared by both components,
+// max(|m.x|, |m.y|) kept in [0.5, 1). Same 24-bit precision as f32, but the
+// exponent range of an int, so values like 1e-200 are fine.
+// ---------------------------------------------------------------------------
+
+constant int FE_ZERO_EXP = -1000000; // must match FE_ZERO_EXP in perturb.rs
+
+struct cfe { float2 m; int e; };
+
+inline cfe cfe_make(float2 m, int e) {
+    float a = max(abs(m.x), abs(m.y));
+    if (a == 0.0) return cfe{float2(0.0), FE_ZERO_EXP};
+    int k;
+    frexp(a, k);
+    return cfe{float2(ldexp(m.x, -k), ldexp(m.y, -k)), e + k};
+}
+
+inline float2 cfe_to_float2(cfe a) {
+    return float2(ldexp(a.m.x, a.e), ldexp(a.m.y, a.e)); // underflows to 0 if tiny
+}
+
+inline cfe cfe_add(cfe a, cfe b) {
+    if (a.e < b.e) { cfe t = a; a = b; b = t; }
+    int d = b.e - a.e;               // <= 0: shift the smaller operand down
+    if (d < -40) return a;           // below a's precision (also catches zero)
+    return cfe_make(a.m + float2(ldexp(b.m.x, d), ldexp(b.m.y, d)), a.e);
+}
+
+inline cfe cfe_mul(cfe a, cfe b) {
+    float2 m = float2(a.m.x * b.m.x - a.m.y * b.m.y, a.m.x * b.m.y + a.m.y * b.m.x);
+    return cfe_make(m, a.e + b.e);
+}
+
+/// |a| < |b| using L1 norms.
+inline bool cfe_l1_less(cfe a, cfe b) {
+    float la = abs(a.m.x) + abs(a.m.y);
+    float lb = abs(b.m.x) + abs(b.m.y);
+    if (lb == 0.0) return false;
+    if (la == 0.0) return true;
+    return ldexp(la, clamp(a.e - b.e, -64, 64)) < lb;
+}
+
+// ---------------------------------------------------------------------------
 // Perturbation with rebasing (Zhuoran, 2021).
 //
 // The reference orbit Z (computed on the CPU at high precision for the view
@@ -153,22 +199,83 @@ float iterate_df(df cx, df cy, uint max_iter, float period_eps) {
 // so this is exact. Same when the reference orbit runs out (it escaped, or hit
 // max_iter). With rebasing a single reference serves the whole image, with no
 // glitch detection or secondary references.
-float iterate_perturb(float2 dc, device const float2* ref, uint ref_len, uint max_iter) {
+//
+// Two phases, because at deep zoom dz starts out far below f32's range:
+//   extended: dz in floatexp until |dz| > 2^-100 (typically a few hundred or
+//             thousand iterations at very deep zoom; skipped entirely above
+//             ~1e30 since dz starts out large enough)
+//   fast:     plain f32, as long as |dz| stays above 2^-110
+// dc may underflow to 0 in the fast phase; by then it is ~1e-7 or less of dz,
+// i.e. below f32 precision anyway.
+// ---------------------------------------------------------------------------
+
+// Must match `RefPoint` in perturb.rs.
+struct RefPoint {
+    float2 z;     // Z rounded to f32
+    float2 m;     // Z as floatexp mantissa...
+    int    e;     // ...and exponent
+    int    _pad;
+};
+
+constant int   EXTENDED_TO_FAST_EXP = -100;     // |dz| >~ 2^-100
+constant float FAST_TO_EXTENDED     = 7.70371978e-34; // 2^-110
+
+float iterate_perturb(cfe dc, device const RefPoint* ref, uint ref_len, uint max_iter) {
+    float2 dcf = cfe_to_float2(dc);
+    cfe dzx = cfe{float2(0.0), FE_ZERO_EXP};
     float2 dz = float2(0.0);
     uint m = 0;
-    for (uint n = 0; n < max_iter; ++n) {
-        float2 t = 2.0 * ref[m] + dz;
-        dz = float2(t.x * dz.x - t.y * dz.y, t.x * dz.y + t.y * dz.x) + dc;
-        ++m;
+    uint n = 0;
+    bool extended = true;
 
-        float2 z = ref[m] + dz;
-        float r2 = dot(z, z);
-        if (r2 > BAILOUT2) return smooth_mu(n, r2);
+    while (n < max_iter) {
+        if (extended) {
+            for (; n < max_iter; ++n) {
+                cfe Z = cfe{ref[m].m, ref[m].e};
+                cfe t = cfe_add(cfe{Z.m, Z.e + 1}, dzx);   // 2Z + dz
+                dzx = cfe_add(cfe_mul(t, dzx), dc);
+                ++m;
 
-        // L1 norms: squares of ~1e-30 deltas would underflow f32.
-        if (abs(z.x) + abs(z.y) < abs(dz.x) + abs(dz.y) || m >= ref_len - 1) {
-            dz = z;
-            m = 0;
+                cfe z = cfe_add(cfe{ref[m].m, ref[m].e}, dzx);
+                float2 zf = cfe_to_float2(z);
+                float r2 = dot(zf, zf);
+                if (r2 > BAILOUT2) return smooth_mu(n, r2);
+
+                if (cfe_l1_less(z, dzx) || m >= ref_len - 1) {
+                    dzx = z;
+                    m = 0;
+                }
+                if (dzx.e > EXTENDED_TO_FAST_EXP) {
+                    dz = cfe_to_float2(dzx);
+                    extended = false;
+                    ++n;
+                    break;
+                }
+            }
+        } else {
+            for (; n < max_iter; ++n) {
+                float2 t = 2.0 * ref[m].z + dz;
+                dz = float2(t.x * dz.x - t.y * dz.y, t.x * dz.y + t.y * dz.x) + dcf;
+                ++m;
+
+                float2 z = ref[m].z + dz;
+                float r2 = dot(z, z);
+                if (r2 > BAILOUT2) return smooth_mu(n, r2);
+
+                // L1 norms: squares of tiny deltas would underflow f32.
+                float dz1 = abs(dz.x) + abs(dz.y);
+                if (abs(z.x) + abs(z.y) < dz1 || m >= ref_len - 1) {
+                    dz = z;
+                    m = 0;
+                    dz1 = abs(dz.x) + abs(dz.y);
+                }
+                if (dz1 < FAST_TO_EXTENDED) {
+                    dzx = cfe_make(dz, 0);
+                    extended = true;
+                    ++n;
+                    break;
+                }
+            }
         }
     }
     return -1.0;
@@ -225,7 +332,7 @@ float3 palette(uint which, float t) {
 
 kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
-                       device const float2* ref           [[buffer(1)]],
+                       device const RefPoint* ref         [[buffer(1)]],
                        uint2 gid                          [[thread_position_in_grid]])
 {
     if (gid.x >= p.width || gid.y >= p.height) return;
@@ -248,7 +355,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         mu = iterate_df(cx, cy, p.max_iter, period_eps);
     } else {
         // The reference is the view center, so dc is just the pixel offset.
-        float2 dc = float2(px, py) * p.scale.x;
+        cfe dc = cfe_make(float2(px, py) * p.scale_m, p.scale_e);
         mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, p.max_iter) : -1.0;
     }
 
