@@ -1,0 +1,4 @@
+/target
+
+# Screenshots saved with the `s` key
+mandelbrot-*.png
