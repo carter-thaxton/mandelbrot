@@ -3,26 +3,87 @@
 //! The app talks only to [`Renderer`]. Each backend (currently Metal) lives in
 //! its own submodule and is selected by [`create`]. A future `wgpu` backend
 //! would implement the same trait and reuse [`GpuParams`] as its uniform.
+//!
+//! Renderers own a persistent *canvas* the size of the window, divided into
+//! [`TILE`]-pixel square tiles. The app fills it progressively, tile batches
+//! at a time, and every `draw` call presents the canvas so partial progress
+//! is visible. When the view moves, `reproject` resamples the existing canvas
+//! into the new view so previous work is reused.
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::app::{FrameParams, Precision};
-use crate::perturb::frexp;
+use crate::perturb::{complex_floatexp, frexp};
 
 #[cfg(target_os = "macos")]
 mod metal;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// Canvas tile edge in pixels. Must match TILE in the shader.
+pub const TILE: u32 = 16;
+
+/// Which tiles of the canvas to compute, and how coarsely.
+#[derive(Clone, Debug)]
+pub struct TileBatch {
+    /// Top-left pixel of each tile (multiples of [`TILE`]).
+    pub tiles: Vec<[u32; 2]>,
+    /// Sample every `step` pixels and fill step x step blocks (1 = full res).
+    /// A power of two no larger than [`TILE`].
+    pub step: u32,
+}
+
+impl TileBatch {
+    /// Every tile of a `width` x `height` canvas.
+    pub fn all(width: u32, height: u32, step: u32) -> Self {
+        let tiles = (0..height.div_ceil(TILE))
+            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| [tx * TILE, ty * TILE]))
+            .collect();
+        Self { tiles, step }
+    }
+}
+
+/// Where the new view lies in the old canvas: new pixel (x, y) shows old
+/// canvas position `old_center + (p - new_center) * ratio + shift`, with
+/// positions in pixels (texel centers at +0.5).
+#[derive(Clone, Copy, Debug)]
+pub struct Reprojection {
+    /// New pixel size in old pixels (< 1 when zooming in).
+    pub ratio: f64,
+    /// New view center minus old, in old pixels (+y down).
+    pub shift: (f64, f64),
+    pub old_size: (u32, u32),
+}
+
+/// Measurements from one `draw`/`capture`, used for scheduling and for
+/// automatic iteration limits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameStats {
+    pub gpu_ms: f64,
+    /// Number of pixels actually iterated.
+    pub samples: u64,
+    /// Highest iteration count among escaped samples.
+    pub max_escaped: u32,
+    /// Escaped samples that needed more than 3/4 of the iteration limit.
+    pub near_limit: u32,
+    /// Samples that never escaped (in the set, or under-iterated).
+    pub interior: u32,
+}
+
 pub trait Renderer {
     /// The drawable surface changed size (physical pixels) or backing scale.
+    /// Canvas contents are undefined afterwards.
     fn resize(&mut self, width: u32, height: u32, scale_factor: f64);
 
-    /// Draw one frame to the window. Returns GPU time in milliseconds if known.
-    fn render(&mut self, params: &FrameParams) -> Result<Option<f64>>;
+    /// Compute `batch` of the canvas, then present the canvas to the window.
+    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats>;
+
+    /// Resample the canvas contents for a new view (see [`Reprojection`]).
+    /// Pixels with no source become black.
+    fn reproject(&mut self, xf: &Reprojection) -> Result<()>;
 
     /// Render offscreen at `params.width` x `params.height`; returns RGBA8 rows.
-    fn capture(&mut self, params: &FrameParams) -> Result<Vec<u8>>;
+    fn capture(&mut self, params: &FrameParams, step: u32) -> Result<(Vec<u8>, FrameStats)>;
 }
 
 /// Create the platform's renderer for a window.
@@ -51,8 +112,8 @@ pub fn create_headless() -> Result<Box<dyn Renderer>> {
 }
 
 /// Uniform block shared with the GPU kernel. Layout must match `Params` in the
-/// shader (including its 8-byte alignment, hence `_pad`). Doubles are split
-/// into hi/lo f32 pairs since Apple GPUs (and WGSL) have no f64.
+/// shader (float2 fields are 8-byte aligned there). Doubles are split into
+/// hi/lo f32 pairs since Apple GPUs (and WGSL) have no f64.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuParams {
@@ -70,6 +131,16 @@ pub struct GpuParams {
     /// Scale as floatexp (scale_m * 2^scale_e): below ~1e-38 it has no f32.
     pub scale_m: f32,
     pub scale_e: i32,
+    /// Sample spacing (see [`TileBatch::step`]).
+    pub step: u32,
+    /// View center minus reference point, as complex floatexp (Perturbation).
+    pub ref_off_m: [f32; 2],
+    pub ref_off_e: i32,
+    pub _pad0: [u32; 2],
+    /// Series approximation: start at iteration sa_n with dz = A * dc.
+    pub sa_n: u32,
+    pub sa_a_m: [f32; 2],
+    pub sa_a_e: i32,
     pub _pad: u32,
 }
 
@@ -79,8 +150,10 @@ fn split_f64(v: f64) -> [f32; 2] {
     [hi, lo]
 }
 
-impl From<&FrameParams> for GpuParams {
-    fn from(p: &FrameParams) -> Self {
+impl GpuParams {
+    pub fn new(p: &FrameParams, step: u32) -> Self {
+        let (scale_m, scale_e) = frexp(p.scale);
+        let (ref_off_m, ref_off_e) = complex_floatexp(p.ref_offset.0, p.ref_offset.1);
         Self {
             center_x: split_f64(p.center.0),
             center_y: split_f64(p.center.1),
@@ -96,8 +169,15 @@ impl From<&FrameParams> for GpuParams {
             },
             color_density: p.color_density,
             ref_len: p.reference.as_ref().map_or(0, |r| r.points.len() as u32),
-            scale_m: frexp(p.scale).0 as f32,
-            scale_e: frexp(p.scale).1,
+            scale_m: scale_m as f32,
+            scale_e,
+            step: step.clamp(1, TILE),
+            ref_off_m,
+            ref_off_e,
+            _pad0: [0; 2],
+            sa_n: p.series_n,
+            sa_a_m: p.series_a.0,
+            sa_a_e: p.series_a.1,
             _pad: 0,
         }
     }
@@ -105,7 +185,7 @@ impl From<&FrameParams> for GpuParams {
 
 /// Uninhabited placeholder so `create_headless` can name a window type.
 #[cfg(target_os = "macos")]
-enum NoWindow {}
+pub(crate) enum NoWindow {}
 
 #[cfg(target_os = "macos")]
 impl HasWindowHandle for NoWindow {

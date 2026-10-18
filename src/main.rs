@@ -1,6 +1,7 @@
 mod app;
 mod bigfixed;
 mod perturb;
+mod progressive;
 mod render;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,6 +14,7 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use app::{Explorer, Precision, PrecisionMode};
+use progressive::Scheduler;
 use render::Renderer;
 
 const HELP: &str = "\
@@ -21,7 +23,8 @@ Mandelbrot explorer
   pinch / cmd+scroll / wheel zoom at cursor
   + / -                      zoom in / out (center)
   arrow keys                 pan
-  [ / ]                      fewer / more iterations
+  [ / ]                      fewer / more iterations (switches to manual)
+  a                          automatic iteration limit on / off
   , / .                      color density down / up
   p / shift+p                next / previous palette
   m                          precision: auto -> f32 -> df64 -> perturb
@@ -31,14 +34,14 @@ Mandelbrot explorer
   esc / q                    quit
 
 Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--iters N]
-          [--density D] [--precision f32|df|perturb]";
+          [--density D] [--precision f32|df|perturb] [--no-skip]";
 
 struct App {
     window: Option<Window>,
     renderer: Option<Box<dyn Renderer>>,
     explorer: Explorer,
     modifiers: ModifiersState,
-    last_gpu_ms: Option<f64>,
+    scheduler: Scheduler,
 }
 
 impl App {
@@ -48,7 +51,7 @@ impl App {
             renderer: None,
             explorer: Explorer::new(1, 1),
             modifiers: ModifiersState::empty(),
-            last_gpu_ms: None,
+            scheduler: Scheduler::default(),
         }
     }
 
@@ -56,6 +59,11 @@ impl App {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
+    }
+
+    /// Something changed: the scheduler works out what to reuse and redo.
+    fn invalidate(&mut self) {
+        self.request_redraw();
     }
 
     fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
@@ -70,8 +78,9 @@ impl App {
                 "q" | "Q" => event_loop.exit(),
                 "=" | "+" => e.zoom_at_center(2.0),
                 "-" | "_" => e.zoom_at_center(0.5),
-                "[" => e.iter_multiplier /= 1.5,
-                "]" => e.iter_multiplier *= 1.5,
+                "[" => e.scale_iter_limit(1.0 / 1.5),
+                "]" => e.scale_iter_limit(1.5),
+                "a" | "A" => e.auto_iter = !e.auto_iter,
                 "," | "<" => e.color_density /= 1.25,
                 "." | ">" => e.color_density *= 1.25,
                 "p" => e.cycle_palette(true),
@@ -79,7 +88,6 @@ impl App {
                 "m" | "M" => e.cycle_precision_mode(),
                 "r" | "R" => {
                     e.reset_view();
-                    e.iter_multiplier = 1.0;
                     e.color_density = 1.0;
                 }
                 "s" | "S" => self.save_screenshot(),
@@ -92,7 +100,7 @@ impl App {
             },
             _ => return,
         }
-        self.request_redraw();
+        self.invalidate();
     }
 
     fn save_screenshot(&mut self) {
@@ -100,7 +108,7 @@ impl App {
         let params = self.explorer.frame_params();
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let path = format!("mandelbrot-{secs}.png");
-        match renderer.capture(&params).and_then(|px| write_png(&path, &params, &px)) {
+        match renderer.capture(&params, 1).and_then(|(px, _)| write_png(&path, &params, &px)) {
             Ok(()) => println!("saved {path}"),
             Err(err) => eprintln!("screenshot failed: {err}"),
         }
@@ -137,10 +145,11 @@ impl ApplicationHandler for App {
                 if let (Some(r), Some(w)) = (self.renderer.as_mut(), self.window.as_ref()) {
                     r.resize(size.width, size.height, w.scale_factor());
                 }
-                self.request_redraw();
+                self.scheduler.reset();
+                self.invalidate();
             }
 
-            WindowEvent::ScaleFactorChanged { .. } => self.request_redraw(),
+            WindowEvent::ScaleFactorChanged { .. } => self.invalidate(),
 
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 
@@ -150,7 +159,7 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 if self.explorer.cursor_moved(position.x, position.y) {
-                    self.request_redraw();
+                    self.invalidate();
                 }
             }
 
@@ -176,25 +185,26 @@ impl ApplicationHandler for App {
                         self.explorer.zoom_at_cursor(1.25f64.powf(y as f64));
                     }
                 }
-                self.request_redraw();
+                self.invalidate();
             }
 
             WindowEvent::PinchGesture { delta, .. } => {
                 self.explorer.zoom_at_cursor(delta.exp());
-                self.request_redraw();
+                self.invalidate();
             }
 
             WindowEvent::RedrawRequested => {
-                let params = self.explorer.frame_params();
-                if let Some(r) = self.renderer.as_mut() {
-                    match r.render(&params) {
-                        Ok(Some(ms)) => self.last_gpu_ms = Some(ms),
-                        Ok(None) => {}
-                        Err(err) => eprintln!("render failed: {err}"),
-                    }
+                let Some(r) = self.renderer.as_mut() else { return };
+                // One budget-sized slice of work per display refresh; input
+                // that arrives in between invalidates the rest.
+                match self.scheduler.step(&mut self.explorer, r.as_mut()) {
+                    Ok(true) => self.request_redraw(),
+                    Ok(false) => {}
+                    Err(err) => eprintln!("render failed: {err}"),
                 }
                 if let Some(w) = &self.window {
-                    w.set_title(&self.explorer.hud(self.last_gpu_ms));
+                    let hud = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
+                    w.set_title(&hud);
                 }
             }
 
@@ -219,8 +229,9 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     let mut center: Option<(String, String)> = None;
     let mut zoom = 1.0f64;
     let mut precision = PrecisionMode::Auto;
-    let mut iters: Option<f64> = None;
+    let mut iters: Option<u32> = None;
     let mut density = 1.0f32;
+    let mut series_skip = true;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut val = || it.next().cloned().ok_or(format!("{arg} needs a value"));
@@ -240,6 +251,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
             "--zoom" => zoom = val()?.parse().map_err(|_| "bad zoom")?,
             "--iters" => iters = Some(val()?.parse().map_err(|_| "bad iters")?),
             "--density" => density = val()?.parse().map_err(|_| "bad density")?,
+            "--no-skip" => series_skip = false,
             "--precision" => {
                 precision = match val()?.as_str() {
                     "f32" => PrecisionMode::Forced(Precision::F32),
@@ -260,15 +272,34 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     }
     explorer.zoom_at_center(zoom);
     explorer.color_density = density;
+    explorer.series_skip = series_skip;
+    explorer.iter_limit = explorer.estimate_iter();
     if let Some(n) = iters {
-        explorer.iter_multiplier = n / explorer.max_iter() as f64;
+        explorer.set_iter_limit(n);
     }
 
     let mut renderer = render::create_headless()?;
-    let params = explorer.frame_params();
     let start = std::time::Instant::now();
-    let pixels = renderer.capture(&params)?;
-    println!("{}  ({:.1} ms)", explorer.hud(None), start.elapsed().as_secs_f64() * 1000.0);
+    // Settle the automatic iteration limit on cheap coarse passes, as the
+    // interactive preview does.
+    for _ in 0..8 {
+        let (_, stats) = renderer.capture(&explorer.frame_params(), 4)?;
+        if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
+            eprintln!("settle: limit {} -> {stats:?}", explorer.iter_limit);
+        }
+        if !explorer.observe(&stats, true) {
+            break;
+        }
+    }
+    let settle_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let params = explorer.frame_params();
+    let (pixels, stats) = renderer.capture(&params, 1)?;
+    println!(
+        "{}  (settle {settle_ms:.0} ms, gpu {:.1} ms, total {:.1} ms)",
+        explorer.hud(None, None),
+        stats.gpu_ms,
+        start.elapsed().as_secs_f64() * 1000.0
+    );
     write_png(&path, &params, &pixels)
 }
 
@@ -289,4 +320,58 @@ fn main() {
     println!("{HELP}");
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.run_app(&mut App::new()).expect("event loop failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fraction of pixels whose color differs noticeably between two images.
+    fn differing(a: &[u8], b: &[u8]) -> f64 {
+        let n = a.len() / 4;
+        let bad = a
+            .chunks(4)
+            .zip(b.chunks(4))
+            .filter(|(x, y)| (0..3).any(|i| x[i].abs_diff(y[i]) > 16))
+            .count();
+        bad as f64 / n as f64
+    }
+
+    /// Rendering against a reused, off-center reference (as happens while
+    /// panning) must match rendering against a fresh centered one.
+    #[test]
+    fn gpu_off_center_reference_matches_fresh() {
+        let mut renderer = render::create_headless().expect("Metal device");
+        for zoom in [1e8, 1e40] {
+            let mut panned = Explorer::new(320, 200);
+            // c = i: a boundary point with smooth surroundings at every depth,
+            // so any offset error shows up as a visibly shifted image.
+            panned.set_center_str("0", "1");
+            panned.zoom_at_center(zoom);
+            panned.set_iter_limit(4000);
+            panned.frame_params(); // creates the reference at this center
+            panned.pan_pixels(120.0, -70.0);
+            let reused = panned.frame_params();
+            assert!(reused.ref_offset != (0.0, 0.0), "reference should have been reused");
+
+            let mut fresh = Explorer::new(320, 200);
+            fresh.center = panned.center.clone();
+            fresh.scale = panned.scale;
+            fresh.set_iter_limit(4000);
+            let centered = fresh.frame_params();
+            // Only the truncation of the center to the needed precision.
+            let off = centered.ref_offset.0.abs().max(centered.ref_offset.1.abs());
+            assert!(off < centered.scale * 1e-6, "{off:e}");
+
+            let (a, _) = renderer.capture(&reused, 1).unwrap();
+            let (b, _) = renderer.capture(&centered, 1).unwrap();
+            if let Ok(dir) = std::env::var("MANDEL_TEST_DUMP") {
+                write_png(&format!("{dir}/reused_{zoom:e}.png"), &reused, &a).unwrap();
+                write_png(&format!("{dir}/fresh_{zoom:e}.png"), &centered, &b).unwrap();
+            }
+            let d = differing(&a, &b);
+            // Different references round differently right at the boundary.
+            assert!(d < 0.01, "zoom {zoom}: {:.2}% of pixels differ", d * 100.0);
+        }
+    }
 }

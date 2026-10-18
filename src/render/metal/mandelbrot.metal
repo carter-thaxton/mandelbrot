@@ -26,7 +26,25 @@ struct Params {
     uint   ref_len;
     float  scale_m;    // scale as floatexp: scale_m * 2^scale_e
     int    scale_e;
+    uint   step;       // sample every `step` pixels, filling step x step blocks
+    float2 ref_off_m;  // view center - reference point, as complex floatexp
+    int    ref_off_e;
+    uint   _pad0a;     // (two uints, not a uint2: keeps 4-byte alignment)
+    uint   _pad0b;
+    uint   sa_n;       // series approximation: start at iteration sa_n...
+    float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
+    int    sa_a_e;
     uint   _pad;
+};
+
+constant uint TILE = 16; // must match TILE in src/render/mod.rs
+
+// Must match `GpuStats` in render/metal/mod.rs.
+struct Stats {
+    atomic_uint max_escaped;  // highest iteration count among escaped samples
+    atomic_uint near_limit;   // escaped samples needing > 3/4 of max_iter
+    atomic_uint interior;     // samples that never escaped
+    uint        _pad;
 };
 
 constant float BAILOUT2 = 65536.0; // |z| > 256: large radius for smooth coloring
@@ -220,12 +238,15 @@ struct RefPoint {
 constant int   EXTENDED_TO_FAST_EXP = -100;     // |dz| >~ 2^-100
 constant float FAST_TO_EXTENDED     = 7.70371978e-34; // 2^-110
 
-float iterate_perturb(cfe dc, device const RefPoint* ref, uint ref_len, uint max_iter) {
+float iterate_perturb(cfe dc, device const RefPoint* ref, uint ref_len, uint max_iter,
+                      uint skip, cfe skip_a) {
     float2 dcf = cfe_to_float2(dc);
-    cfe dzx = cfe{float2(0.0), FE_ZERO_EXP};
+    // Series approximation: the first `skip` iterations are linear in dc,
+    // so jump straight to dz = A * dc (the CPU checked the error bound).
+    cfe dzx = skip > 0 ? cfe_mul(skip_a, dc) : cfe{float2(0.0), FE_ZERO_EXP};
     float2 dz = float2(0.0);
-    uint m = 0;
-    uint n = 0;
+    uint m = skip;
+    uint n = skip;
     bool extended = true;
 
     while (n < max_iter) {
@@ -333,36 +354,104 @@ float3 palette(uint which, float t) {
 kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
                        device const RefPoint* ref         [[buffer(1)]],
-                       uint2 gid                          [[thread_position_in_grid]])
+                       device Stats& stats                [[buffer(2)]],
+                       device const uint2* tiles          [[buffer(3)]],
+                       uint3 gid                          [[thread_position_in_grid]])
 {
-    if (gid.x >= p.width || gid.y >= p.height) return;
+    // Grid: (TILE/step, TILE/step, tile count). Each thread computes one
+    // sample at the center of a step x step block within its tile.
+    uint2 tile = tiles[gid.z];
+    uint x0 = tile.x + gid.x * p.step;
+    uint y0 = tile.y + gid.y * p.step;
+    // No early return: every thread must take part in the SIMD reductions.
+    bool valid = gid.x * p.step < TILE && gid.y * p.step < TILE && x0 < p.width && y0 < p.height;
 
-    // Pixel offset from the view center; exact in f32 for any sane size.
-    float px = float(gid.x) + 0.5 - 0.5 * float(p.width);
-    float py = 0.5 * float(p.height) - (float(gid.y) + 0.5);
+    float mu = -1.0;
+    if (valid) {
+        // Sample offset from the view center, in pixels; exact in f32.
+        float half_block = 0.5 * float(p.step);
+        float px = float(x0) + half_block - 0.5 * float(p.width);
+        float py = 0.5 * float(p.height) - (float(y0) + half_block);
 
-    // A cycle is "detected" when the orbit returns to well within a pixel.
-    float period_eps = max(p.scale.x * 1e-3, 1e-30);
+        // A cycle is "detected" when the orbit returns to well within a pixel.
+        float period_eps = max(p.scale.x * 1e-3, 1e-30);
 
-    float mu;
-    if (p.precision == 0) {
-        float2 c = float2(p.center_x.x + px * p.scale.x,
-                          p.center_y.x + py * p.scale.x);
-        mu = iterate_f32(c, p.max_iter, max(period_eps, 1e-7));
-    } else if (p.precision == 1) {
-        df cx = df_add(p.center_x, df_mul_f(p.scale, px));
-        df cy = df_add(p.center_y, df_mul_f(p.scale, py));
-        mu = iterate_df(cx, cy, p.max_iter, period_eps);
-    } else {
-        // The reference is the view center, so dc is just the pixel offset.
-        cfe dc = cfe_make(float2(px, py) * p.scale_m, p.scale_e);
-        mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, p.max_iter) : -1.0;
+        if (p.precision == 0) {
+            float2 c = float2(p.center_x.x + px * p.scale.x,
+                              p.center_y.x + py * p.scale.x);
+            mu = iterate_f32(c, p.max_iter, max(period_eps, 1e-7));
+        } else if (p.precision == 1) {
+            df cx = df_add(p.center_x, df_mul_f(p.scale, px));
+            df cy = df_add(p.center_y, df_mul_f(p.scale, py));
+            mu = iterate_df(cx, cy, p.max_iter, period_eps);
+        } else {
+            // dc = c - C: pixel offset from the view center, plus the view
+            // center's offset from the (possibly off-center) reference point.
+            cfe dc = cfe_add(cfe_make(float2(px, py) * p.scale_m, p.scale_e),
+                             cfe{p.ref_off_m, p.ref_off_e});
+            mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, p.max_iter,
+                                                  p.sa_n, cfe{p.sa_a_m, p.sa_a_e})
+                                : -1.0;
+        }
+
+        float3 rgb = float3(0.0);
+        if (mu >= 0.0) {
+            float t = mu * 0.02 * p.color_density;
+            rgb = palette(p.palette, t);
+        }
+        uint x1 = min(x0 + p.step, p.width);
+        uint y1 = min(y0 + p.step, p.height);
+        for (uint y = y0; y < y1; ++y) {
+            for (uint x = x0; x < x1; ++x) {
+                out.write(float4(rgb, 1.0), uint2(x, y));
+            }
+        }
     }
 
-    float3 rgb = float3(0.0);
-    if (mu >= 0.0) {
-        float t = mu * 0.02 * p.color_density;
-        rgb = palette(p.palette, t);
+    // Statistics for automatic iteration limits: reduce across the SIMD group
+    // first so only one thread per group touches the atomics.
+    bool escaped = valid && mu >= 0.0;
+    uint n = escaped ? uint(mu) : 0;
+    uint group_max = simd_max(n);
+    uint group_near = simd_sum(uint(escaped && n > p.max_iter / 4 * 3));
+    uint group_interior = simd_sum(uint(valid && !escaped));
+    if (simd_is_first()) {
+        atomic_fetch_max_explicit(&stats.max_escaped, group_max, memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats.near_limit, group_near, memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats.interior, group_interior, memory_order_relaxed);
     }
-    out.write(float4(rgb, 1.0), gid);
+}
+
+// ---------------------------------------------------------------------------
+// Reprojection: resample the previous canvas into a moved/zoomed view, so the
+// old image serves as the preview and only new or stale tiles are recomputed.
+// ---------------------------------------------------------------------------
+
+// Must match `GpuReprojection` in render/metal/mod.rs.
+struct Reprojection {
+    float  ratio;      // new pixel size in old pixels
+    float  _pad;
+    float2 shift;      // new center - old center, in old pixels (+y down)
+    uint   old_w;
+    uint   old_h;
+};
+
+kernel void reproject(texture2d<float, access::sample> src [[texture(0)]],
+                      texture2d<float, access::write>  dst [[texture(1)]],
+                      constant Reprojection& r             [[buffer(0)]],
+                      uint2 gid                            [[thread_position_in_grid]])
+{
+    uint2 size = uint2(dst.get_width(), dst.get_height());
+    if (gid.x >= size.x || gid.y >= size.y) return;
+
+    float2 old_size = float2(r.old_w, r.old_h);
+    float2 u = 0.5 * old_size + (float2(gid) + 0.5 - 0.5 * float2(size)) * r.ratio + r.shift;
+    float4 c = float4(0.0, 0.0, 0.0, 1.0);
+    if (all(u >= 0.0) && all(u <= old_size)) {
+        // Bilinear; lands exactly on texel centers for whole-pixel pans, so
+        // those copy the old pixels unchanged.
+        constexpr sampler smp(coord::pixel, filter::linear, address::clamp_to_edge);
+        c = src.sample(smp, u);
+    }
+    dst.write(c, gid);
 }
