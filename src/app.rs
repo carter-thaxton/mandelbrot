@@ -104,6 +104,12 @@ pub const MAX_ITER: u32 = 200_000;
 /// valley (5.4k needed at 1e10, 62k at 1e30); flatter places just get
 /// corrected down.
 const ITERS_PER_ZOOM: f64 = 0.04;
+/// Most the predictor may raise the limit in one view change. A sudden deep
+/// jump would otherwise multiply it by thousands (straight to MAX_ITER), and
+/// from above it can get stuck: around a minibrot a few pixels always escape
+/// very late, so the shrink rule never fires. From below, the statistics
+/// double it cheaply until it's enough, then stop.
+const MAX_PREDICTED_GROWTH: f64 = 2.0;
 
 /// A reference may be used while within this many view sizes of the center;
 /// beyond it, f32 deltas lose too much precision and we recompute in place.
@@ -225,10 +231,12 @@ impl Explorer {
     }
 
     /// In auto mode, scale the iteration limit with a zoom by `factor` (> 1
-    /// zooms in), in >= 5% steps.
+    /// zooms in), in >= 5% steps. Growth is capped per call
+    /// (MAX_PREDICTED_GROWTH); shrinking isn't, since it's cheap and the
+    /// statistics raise it again if needed.
     fn track_depth(&mut self, factor: f64) {
         if self.auto_iter {
-            self.iter_drift *= factor.powf(ITERS_PER_ZOOM);
+            self.iter_drift *= factor.powf(ITERS_PER_ZOOM).min(MAX_PREDICTED_GROWTH);
             if !(1.0 / 1.05..=1.05).contains(&self.iter_drift) {
                 let n = self.iter_limit as f64 * self.iter_drift;
                 self.iter_limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
@@ -642,8 +650,21 @@ mod tests {
         deep.span = 1e-150;
         e.go_to(&deep);
         assert!(e.center.0.frac_limbs() >= frac_limbs_for_scale(e.scale));
-        // Auto iterations follow the depth, as zooming does.
-        assert!(e.iter_limit > e.estimate_iter() / 4, "{}", e.iter_limit);
+    }
+
+    #[test]
+    fn sudden_jumps_raise_iterations_only_a_little() {
+        let mut e = Explorer::new(800, 600);
+        let before = e.iter_limit;
+        let mut deep = e.home_place();
+        deep.span = 1e-80;
+        e.go_to(&deep);
+        // The full prediction would be ~1500x; statistics ramp up from here.
+        assert!(e.iter_limit > before && e.iter_limit as f64 <= before as f64 * MAX_PREDICTED_GROWTH);
+        // Jumping back out shrinks freely.
+        e.iter_limit = 50_000;
+        e.go_to(&e.home_place());
+        assert!(e.iter_limit < 50_000 / 100, "{}", e.iter_limit);
     }
 
     #[test]

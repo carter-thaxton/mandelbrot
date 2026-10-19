@@ -36,6 +36,12 @@ use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, Ti
 
 /// GPU time to aim for per frame (ms). Leaves headroom inside a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 12.0;
+/// Never compute fewer samples per frame than this. A dispatch lasts at least
+/// as long as its slowest pixel, so below the size that fills the GPU a
+/// smaller batch saves no time, it only idles the GPU. On deep views that
+/// floor (one slow pixel, ~16 ms at 32k iterations) exceeds the budget, and
+/// without this minimum the batches shrank to ~8 tiles: 30x slower overall.
+const MIN_SAMPLES_PER_FRAME: f64 = 65536.0;
 /// Minimum time between statistics probes while the view keeps changing.
 const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(120);
 /// Probes sample at least this coarsely (they only need statistics).
@@ -206,8 +212,9 @@ pub struct Scheduler {
     canvas: Option<Canvas>,
     /// Current sweep for the automatic iteration limit (reset on any change).
     sweep: Option<Sweep>,
-    /// Smoothed GPU cost of one sample (ms); 0 until first measured.
-    ms_per_sample: f64,
+    /// Samples to compute per frame to fill FRAME_BUDGET_MS; 0 until first
+    /// measured (see [`Scheduler::record`]).
+    samples_per_frame: f64,
     /// GPU time spent since the view last changed.
     work_ms: f64,
     /// The view or look changed since the last statistics probe.
@@ -243,25 +250,26 @@ impl Scheduler {
         self.work_ms
     }
 
+    /// Size the next frame's work from how long this draw took: drop at once
+    /// when over budget, grow at most 2x per frame when under (see also
+    /// MIN_SAMPLES_PER_FRAME).
     fn record(&mut self, stats: &FrameStats) {
         self.work_ms += stats.gpu_ms;
-        if stats.samples > 0 {
-            let cost = stats.gpu_ms / stats.samples as f64;
-            self.ms_per_sample = if self.ms_per_sample == 0.0 {
-                cost
-            } else {
-                0.5 * (self.ms_per_sample + cost)
-            };
+        if stats.samples == 0 {
+            return;
         }
+        let target = stats.samples as f64 * FRAME_BUDGET_MS / stats.gpu_ms.max(1e-3);
+        let current = self.samples_per_frame;
+        self.samples_per_frame = if current == 0.0 { target } else { target.min(current * 2.0) };
     }
 
     /// Samples affordable in one frame.
     fn budget_samples(&self, p: &FrameParams) -> f64 {
-        if self.ms_per_sample == 0.0 {
+        if self.samples_per_frame == 0.0 {
             // Unknown cost: assume a 4x4-block preview of the view fits.
-            (p.width as f64 * p.height as f64 / 16.0).max(1.0)
+            (p.width as f64 * p.height as f64 / 16.0).max(MIN_SAMPLES_PER_FRAME)
         } else {
-            FRAME_BUDGET_MS / self.ms_per_sample
+            self.samples_per_frame.max(MIN_SAMPLES_PER_FRAME)
         }
     }
 

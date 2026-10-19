@@ -104,7 +104,8 @@ fn iteration_limit_is_judged_per_sweep_not_per_batch() {
         let near_limit = if b.step == 1 { (samples / 50) as u32 } else { 0 };
         stats(samples, p.max_iter - 1, near_limit, 0)
     });
-    let mut e = Explorer::new(400, 304);
+    // Window-sized, so a sweep takes many batches even at the minimum batch size.
+    let mut e = Explorer::new(2400, 1600);
     let mut s = Scheduler::default();
     let start = e.iter_limit;
     let mut steps = 0;
