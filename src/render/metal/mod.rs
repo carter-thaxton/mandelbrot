@@ -1,10 +1,13 @@
 //! Metal backend: the only module that touches objc2 / Metal / Core Animation.
 //!
-//! A compute kernel writes into a persistent canvas texture, which `present`
-//! blits to the CAMetalLayer's drawable (so the layer is created with
-//! `framebufferOnly = false`); no render pass or vertex pipeline is needed.
-//! A second kernel resamples the canvas into a spare texture when the view
-//! moves, and the two are swapped.
+//! Three compute kernels, no render pass or vertex pipeline:
+//! - `mandelbrot` writes each pixel's smooth iteration count (mu) into a
+//!   persistent single-channel float canvas;
+//! - `colorize` turns mu into colors, straight into the CAMetalLayer's
+//!   drawable when presenting (so the layer has `framebufferOnly = false`),
+//!   or into an RGBA texture for snapshots and captures;
+//! - `reproject` resamples the canvas into a spare texture when the view
+//!   moves, and the two are swapped.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -16,7 +19,7 @@ use objc2_app_kit::NSView;
 use objc2_core_foundation::CGSize;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLMathMode, MTLOrigin, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
@@ -26,7 +29,7 @@ use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use super::{FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch};
-use crate::app::FrameParams;
+use crate::app::{Colors, FrameParams};
 use crate::perturb::ReferenceOrbit;
 
 const SHADER_SOURCE: &str = include_str!("mandelbrot.metal");
@@ -47,6 +50,18 @@ struct GpuReprojection {
     old_h: u32,
 }
 
+/// Layout of `Colors` in the shader.
+#[repr(C)]
+struct GpuColors {
+    palette: u32,
+    density: f32,
+    offset: f32,
+    _pad: u32,
+}
+
+/// The canvas format: one f32 of smooth iteration count per pixel.
+const CANVAS_FORMAT: MTLPixelFormat = MTLPixelFormat::R32Float;
+
 /// Layout of the kernel's stats buffer (buffer 2); see `FrameStats`.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -62,9 +77,10 @@ pub struct MetalRenderer {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipeline: Retained<Pipeline>,
     reproject_pipeline: Retained<Pipeline>,
+    colorize_pipeline: Retained<Pipeline>,
     /// None for headless (capture-only) renderers.
     layer: Option<Retained<CAMetalLayer>>,
-    /// Persistent image the kernel fills progressively; presented by blit.
+    /// Persistent mu image the kernel fills progressively; colorized to present.
     canvas: Option<Retained<Texture>>,
     /// Same size as `canvas`: the target of `reproject`, then swapped in.
     spare: Option<Retained<Texture>>,
@@ -83,6 +99,7 @@ impl MetalRenderer {
         let library = build_library(&device)?;
         let pipeline = build_pipeline(&device, &library, "mandelbrot")?;
         let reproject_pipeline = build_pipeline(&device, &library, "reproject")?;
+        let colorize_pipeline = build_pipeline(&device, &library, "colorize")?;
         let layer = window.map(|w| attach_layer(w, &device)).transpose()?;
         let empty_buffer = new_buffer(&device, &[0u8; 64])?;
         let stats = new_buffer(&device, &[GpuStats::default()])?;
@@ -91,6 +108,7 @@ impl MetalRenderer {
             queue,
             pipeline,
             reproject_pipeline,
+            colorize_pipeline,
             layer,
             canvas: None,
             spare: None,
@@ -215,6 +233,48 @@ impl MetalRenderer {
         desc.setStorageMode(if shared { MTLStorageMode::Shared } else { MTLStorageMode::Private });
         self.device.newTextureWithDescriptor(&desc).ok_or_else(|| "failed to create texture".into())
     }
+
+    /// Encode coloring the mu texture `mu` into `out` (sized as `out`).
+    fn encode_colorize(&self, cmd: &CommandBuffer, mu: &Texture, out: &Texture, colors: &Colors) -> Result<()> {
+        let gpu = GpuColors { palette: colors.palette, density: colors.density, offset: colors.offset, _pad: 0 };
+        let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
+        enc.setComputePipelineState(&self.colorize_pipeline);
+        // SAFETY: textures 0/1 and buffer 0 match the `colorize` kernel, and
+        // setBytes copies `gpu` before returning.
+        unsafe {
+            enc.setTexture_atIndex(Some(mu), 0);
+            enc.setTexture_atIndex(Some(out), 1);
+            enc.setBytes_length_atIndex(NonNull::from(&gpu).cast::<c_void>(), size_of::<GpuColors>(), 0);
+        }
+        enc.dispatchThreads_threadsPerThreadgroup(
+            MTLSize { width: out.width(), height: out.height(), depth: 1 },
+            MTLSize { width: 16, height: 16, depth: 1 },
+        );
+        enc.endEncoding();
+        Ok(())
+    }
+
+    /// Color `mu` and read the result back as RGBA8 rows.
+    fn colorized_rgba(&self, mu: &Texture, colors: &Colors) -> Result<Vec<u8>> {
+        let (w, h) = (mu.width(), mu.height());
+        let rgba = self.new_texture(w, h, MTLPixelFormat::RGBA8Unorm, true)?;
+        let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
+        self.encode_colorize(&cmd, mu, &rgba, colors)?;
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        let mut pixels = vec![0u8; w * h * 4];
+        let region = MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: w, height: h, depth: 1 } };
+        // SAFETY: `pixels` holds exactly h rows of w*4 bytes, matching the region.
+        unsafe {
+            rgba.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(pixels.as_mut_ptr().cast()).unwrap(),
+                w * 4,
+                region,
+                0,
+            );
+        }
+        Ok(pixels)
+    }
 }
 
 impl Renderer for MetalRenderer {
@@ -224,7 +284,7 @@ impl Renderer for MetalRenderer {
             layer.setDrawableSize(CGSize { width: width as f64, height: height as f64 });
         }
         let make = || {
-            self.new_texture(width.max(1) as usize, height.max(1) as usize, MTLPixelFormat::BGRA8Unorm, false)
+            self.new_texture(width.max(1) as usize, height.max(1) as usize, CANVAS_FORMAT, false)
                 .map_err(|e| eprintln!("{e}"))
                 .ok()
         };
@@ -279,91 +339,35 @@ impl Renderer for MetalRenderer {
         self.finish(&cmd, samples)
     }
 
-    fn present(&mut self) -> Result<()> {
+    fn present(&mut self, colors: &Colors) -> Result<()> {
         // Headless renderers (tests, captures) have nowhere to present to.
         let Some(layer) = &self.layer else { return Ok(()) };
         let canvas = self.canvas.clone().ok_or("present() before resize()")?;
         let Some(drawable) = layer.nextDrawable() else {
             return Ok(()); // e.g. window minimized
         };
-        // Copy the whole canvas: drawables don't keep earlier contents.
-        let target = drawable.texture();
-        let w = canvas.width().min(target.width());
-        let h = canvas.height().min(target.height());
+        // Color the whole canvas: drawables don't keep earlier contents.
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
-        let blit = cmd.blitCommandEncoder().ok_or("failed to create blit encoder")?;
-        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
-        // SAFETY: same pixel format, and the copied size fits both textures.
-        unsafe {
-            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                &canvas, 0, 0, origin, MTLSize { width: w, height: h, depth: 1 },
-                &target, 0, 0, origin,
-            );
-        }
-        blit.endEncoding();
+        self.encode_colorize(&cmd, &canvas, &drawable.texture(), colors)?;
         cmd.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        // No wait: later work on this queue is ordered after the copy.
+        // No wait: later work on this queue is ordered after the coloring.
         cmd.commit();
         Ok(())
     }
 
-    fn snapshot(&mut self) -> Result<Vec<u8>> {
+    fn snapshot(&mut self, colors: &Colors) -> Result<Vec<u8>> {
         let canvas = self.canvas.clone().ok_or("snapshot() before resize()")?;
-        let (w, h) = (canvas.width(), canvas.height());
-        // The canvas is GPU-private: copy it somewhere the CPU can read.
-        let shared = self.new_texture(w, h, MTLPixelFormat::BGRA8Unorm, true)?;
-        let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
-        let blit = cmd.blitCommandEncoder().ok_or("failed to create blit encoder")?;
-        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
-        let size = MTLSize { width: w, height: h, depth: 1 };
-        // SAFETY: same size and pixel format.
-        unsafe {
-            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                &canvas, 0, 0, origin, size, &shared, 0, 0, origin,
-            );
-        }
-        blit.endEncoding();
-        cmd.commit();
-        cmd.waitUntilCompleted();
-        let mut pixels = vec![0u8; w * h * 4];
-        // SAFETY: `pixels` holds exactly h rows of w*4 bytes, matching the region.
-        unsafe {
-            shared.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-                NonNull::new(pixels.as_mut_ptr().cast()).unwrap(),
-                w * 4,
-                MTLRegion { origin, size },
-                0,
-            );
-        }
-        for px in pixels.chunks_mut(4) {
-            px.swap(0, 2); // BGRA -> RGBA
-        }
-        Ok(pixels)
+        self.colorized_rgba(&canvas, colors)
     }
 
-    fn capture(&mut self, params: &FrameParams, step: u32) -> Result<(Vec<u8>, FrameStats)> {
+    fn capture(&mut self, params: &FrameParams, step: u32, colors: &Colors) -> Result<(Vec<u8>, FrameStats)> {
         let (w, h) = (params.width as usize, params.height as usize);
-        let texture = self.new_texture(w, h, MTLPixelFormat::RGBA8Unorm, true)?;
+        let mu = self.new_texture(w, h, CANVAS_FORMAT, false)?;
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
         let batch = TileBatch::all(params.width, params.height, step, Output::Pixels);
-        let samples = self.encode(&cmd, &texture, params, &batch)?;
+        let samples = self.encode(&cmd, &mu, params, &batch)?;
         let stats = self.finish(&cmd, samples)?;
-
-        let mut pixels = vec![0u8; w * h * 4];
-        let region = MTLRegion {
-            origin: MTLOrigin { x: 0, y: 0, z: 0 },
-            size: MTLSize { width: w, height: h, depth: 1 },
-        };
-        // SAFETY: `pixels` holds exactly h rows of w*4 bytes, matching the region.
-        unsafe {
-            texture.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-                NonNull::new(pixels.as_mut_ptr().cast()).unwrap(),
-                w * 4,
-                region,
-                0,
-            );
-        }
-        Ok((pixels, stats))
+        Ok((self.colorized_rgba(&mu, colors)?, stats))
     }
 }
 

@@ -30,7 +30,7 @@
 //!   - A *sweep*: batches accumulated until every tile has been computed for
 //!     the current view and look (full-resolution evidence once settled).
 
-use crate::app::{Explorer, FrameParams, MIN_DECISION_SAMPLES, Precision};
+use crate::app::{Colors, Explorer, FrameParams, MIN_DECISION_SAMPLES, Precision};
 use crate::bigfixed::Fixed;
 use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
 
@@ -57,18 +57,17 @@ struct Tile {
 
 const MISSING: Tile = Tile { res: f32::INFINITY, exact: false };
 
-/// Everything besides geometry that changes pixel colors.
+/// Everything besides geometry that changes the computed values (mu).
+/// Colors aren't part of it: they're applied when presenting.
 #[derive(Clone, PartialEq)]
 struct Look {
-    palette: u32,
-    color_density: f32,
     precision: Precision,
     max_iter: u32,
 }
 
 impl Look {
     fn of(p: &FrameParams) -> Self {
-        Self { palette: p.palette, color_density: p.color_density, precision: p.precision, max_iter: p.max_iter }
+        Self { precision: p.precision, max_iter: p.max_iter }
     }
 }
 
@@ -225,6 +224,8 @@ pub struct Scheduler {
     probe_stats: FrameStats,
     /// Override for PROBE_INTERVAL.
     probe_interval: Option<std::time::Duration>,
+    /// Colors of the last present (a color change alone needs a re-present).
+    presented: Option<Colors>,
 }
 
 impl Scheduler {
@@ -237,6 +238,13 @@ impl Scheduler {
     /// The renderer's canvas was recreated (e.g. window resize): forget it.
     pub fn reset(&mut self) {
         self.canvas = None;
+        self.presented = None;
+    }
+
+    fn present(&mut self, renderer: &mut dyn Renderer, colors: Colors) -> Result<()> {
+        renderer.present(&colors)?;
+        self.presented = Some(colors);
+        Ok(())
     }
 
     /// Fraction of the canvas at full detail, or None once all of it is.
@@ -372,16 +380,19 @@ impl Scheduler {
     /// caller should request another redraw).
     pub fn step(&mut self, explorer: &mut Explorer, renderer: &mut dyn Renderer) -> Result<bool> {
         let params = explorer.frame_params();
+        let colors = explorer.colors();
         let moved = self.sync(View::of(explorer), &params, renderer)?;
+        // What's on screen is stale if the canvas moved or the colors changed.
+        let stale = moved || self.presented != Some(colors);
 
         if self.probe_due
             && explorer.auto_iter
             && self.last_probe.is_none_or(|t| t.elapsed() >= self.probe_interval.unwrap_or(PROBE_INTERVAL))
         {
-            // Spend this frame on whole-view statistics. The canvas only
-            // changed if it was just reprojected.
-            if moved {
-                renderer.present()?;
+            // Spend this frame on whole-view statistics, which don't change
+            // the canvas.
+            if stale {
+                self.present(renderer, colors)?;
             }
             let canvas = self.canvas.as_ref().unwrap();
             let step = self.preview_step(&params).max(PROBE_MIN_STEP);
@@ -408,8 +419,9 @@ impl Scheduler {
         }
 
         let Some((tiles, step)) = self.pick(&params) else {
-            if moved {
-                renderer.present()?; // a reprojection with nothing left to compute
+            if stale {
+                // A reprojection or color change with nothing left to compute.
+                self.present(renderer, colors)?;
             }
             return Ok(false);
         };
@@ -418,7 +430,7 @@ impl Scheduler {
         let total = canvas.tiles.len();
 
         let stats = renderer.draw(&params, &batch)?;
-        renderer.present()?;
+        self.present(renderer, colors)?;
         self.record(&stats);
         let canvas = self.canvas.as_mut().unwrap();
         for &i in &tiles {
@@ -458,7 +470,7 @@ mod tests {
     }
 
     fn look() -> Look {
-        Look { palette: 0, color_density: 1.0, precision: Precision::F32, max_iter: 1000 }
+        Look { precision: Precision::F32, max_iter: 1000 }
     }
 
     /// A canvas whose every tile was computed exactly.

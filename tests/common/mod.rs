@@ -4,7 +4,7 @@
 //! these, hence the `dead_code` allowance.)
 #![allow(dead_code)]
 
-use mandelbrot::app::{Explorer, FrameParams};
+use mandelbrot::app::{Colors, Explorer, FrameParams};
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
 
@@ -68,16 +68,16 @@ impl Renderer for MockRenderer {
         Ok(())
     }
 
-    fn present(&mut self) -> Result<()> {
+    fn present(&mut self, _: &Colors) -> Result<()> {
         self.log.push(Call::Present);
         Ok(())
     }
 
-    fn snapshot(&mut self) -> Result<Vec<u8>> {
+    fn snapshot(&mut self, _: &Colors) -> Result<Vec<u8>> {
         unimplemented!("no pixels in a mock")
     }
 
-    fn capture(&mut self, _: &FrameParams, _: u32) -> Result<(Vec<u8>, FrameStats)> {
+    fn capture(&mut self, _: &FrameParams, _: u32, _: &Colors) -> Result<(Vec<u8>, FrameStats)> {
         unimplemented!("no pixels in a mock")
     }
 }

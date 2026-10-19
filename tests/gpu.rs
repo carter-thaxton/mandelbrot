@@ -5,7 +5,7 @@
 //! Also holds an ignored measurement, `simulated_deep_zoom`:
 //! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
 
-use mandelbrot::app::{Explorer, Place};
+use mandelbrot::app::{Colors, Explorer, Place};
 use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Output, Renderer, TileBatch};
@@ -60,8 +60,8 @@ fn off_center_reference_matches_fresh() {
         let off = centered.ref_offset.0.abs().max(centered.ref_offset.1.abs());
         assert!(off < centered.scale * 1e-6, "{off:e}");
 
-        let (a, _) = r.capture(&reused, 1).unwrap();
-        let (b, _) = r.capture(&centered, 1).unwrap();
+        let (a, _) = r.capture(&reused, 1, &panned.colors()).unwrap();
+        let (b, _) = r.capture(&centered, 1, &fresh.colors()).unwrap();
         let d = differing(&a, &b);
         // Different references round differently right at the boundary.
         assert!(d < 0.01, "zoom {zoom}: {:.2}% of pixels differ", d * 100.0);
@@ -89,8 +89,8 @@ fn reused_canvas_matches_fresh_render() {
     for (what, change) in changes {
         change(&mut e);
         run_to_completion(&mut s, &mut e, r.as_mut());
-        let reused = r.snapshot().unwrap();
-        let (fresh, _) = r.capture(&e.frame_params(), 1).unwrap();
+        let reused = r.snapshot(&e.colors()).unwrap();
+        let (fresh, _) = r.capture(&e.frame_params(), 1, &e.colors()).unwrap();
         let d = differing(&reused, &fresh);
         assert!(d < 0.002, "{what}: {:.3}% of pixels differ", d * 100.0);
     }
@@ -101,18 +101,50 @@ fn stats_only_draw_leaves_canvas_untouched() {
     let (w, h) = (128, 96);
     let mut r = renderer(w, h);
     let mut e = Explorer::new(w, h);
+    let colors = e.colors();
     r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
-    let before = r.snapshot().unwrap();
+    let before = r.snapshot(&colors).unwrap();
 
-    // Different palette, so any write would show.
-    e.cycle_palette(true);
+    // Far fewer iterations change mu (more of the image goes black), so any
+    // write would show.
+    e.set_iter_limit(16);
     let p = e.frame_params();
     let stats = r.draw(&p, &TileBatch::all(w, h, 4, Output::StatsOnly)).unwrap();
     assert!(stats.samples > 0 && stats.max_escaped > 0, "{stats:?}");
-    assert!(r.snapshot().unwrap() == before, "stats-only draw wrote pixels");
+    assert!(r.snapshot(&colors).unwrap() == before, "stats-only draw wrote pixels");
 
     r.draw(&p, &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
-    assert!(r.snapshot().unwrap() != before, "palette change should be visible");
+    assert!(r.snapshot(&colors).unwrap() != before, "the iteration change should be visible");
+}
+
+/// Colors are applied when showing the canvas, not when computing it: the
+/// same canvas gives different images for different colors, and the offset
+/// is a phase (a whole cycle changes nothing).
+#[test]
+fn colors_apply_at_present_time() {
+    let (w, h) = (160, 120);
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    let base = e.colors();
+    let image = r.snapshot(&base).unwrap();
+
+    let other_palette = Colors { palette: base.palette + 1, ..base };
+    let denser = Colors { density: base.density * 1.25, ..base };
+    let shifted = Colors { offset: 0.3, ..base };
+    for colors in [other_palette, denser, shifted] {
+        let other = r.snapshot(&colors).unwrap();
+        assert!(differing(&image, &other) > 0.2, "{colors:?} looks the same");
+        // The set's interior stays black whatever the colors.
+        let black = |px: &[u8]| px.chunks(4).map(|p| p[..3] == [0, 0, 0]).collect::<Vec<_>>();
+        assert_eq!(black(&image), black(&other), "{colors:?} changed the interior");
+    }
+    // A whole cycle of offset is the same image (up to rounding).
+    let cycled = r.snapshot(&Colors { offset: 1.0, ..base }).unwrap();
+    assert!(differing(&image, &cycled) < 0.001);
+    // Matches a fresh capture with the same colors.
+    let (fresh, _) = r.capture(&e.frame_params(), 1, &base).unwrap();
+    assert_eq!(image, fresh);
 }
 
 /// Fraction of pure black (never-escaped) pixels, and number of distinct colors.
@@ -133,7 +165,7 @@ fn presets_render_structure() {
         let mut e = Explorer::new(240, 160);
         e.go_to(&Place::parse(p.x, p.y, p.span).unwrap());
         e.set_iter_limit(20_000);
-        let (px, _) = r.capture(&e.frame_params(), 1).unwrap();
+        let (px, _) = r.capture(&e.frame_params(), 1, &e.colors()).unwrap();
         let (black, colors) = black_and_colors(&px);
         assert!(colors > 50, "{}: only {colors} colors", p.name);
         assert!(black < 0.5, "{}: {:.0}% black", p.name, black * 100.0);
@@ -154,7 +186,7 @@ fn series_skip_and_full_iteration_agree_near_a_nucleus() {
             e.go_to(&Place::parse(star.x, star.y, span).unwrap());
             e.set_iter_limit(3000);
             e.series_skip = skip;
-            images.push(r.capture(&e.frame_params(), 1).unwrap().0);
+            images.push(r.capture(&e.frame_params(), 1, &e.colors()).unwrap().0);
         }
         let (black, _) = black_and_colors(&images[1]);
         assert!(black < 0.5, "span {span:e}: {:.0}% black without the skip", black * 100.0);

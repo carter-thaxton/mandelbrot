@@ -5,15 +5,16 @@
 //! would implement the same trait and reuse [`GpuParams`] as its uniform.
 //!
 //! Renderers own a persistent *canvas* the size of the window, divided into
-//! [`TILE`]-pixel square tiles. The app fills it progressively with `draw`,
-//! tile batches at a time, and calls `present` to show the canvas whenever it
-//! changed, so partial progress is visible. When the view moves, `reproject`
-//! resamples the existing canvas into the new view so previous work is
-//! reused.
+//! [`TILE`]-pixel square tiles. It holds each pixel's smooth iteration count
+//! (mu), not its color. The app fills it progressively with `draw`, tile
+//! batches at a time, and calls `present` to color it (with the current
+//! [`Colors`]) and show it, so partial progress is visible and color changes
+//! never need recomputation. When the view moves, `reproject` resamples the
+//! canvas into the new view so previous work is reused.
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::app::{FrameParams, Precision};
+use crate::app::{Colors, FrameParams, Precision};
 use crate::perturb::{complex_floatexp, frexp};
 
 #[cfg(target_os = "macos")]
@@ -105,18 +106,19 @@ pub trait Renderer {
     /// Nothing appears on screen until [`Renderer::present`].
     fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats>;
 
-    /// Show the current canvas in the window (a no-op without one).
-    fn present(&mut self) -> Result<()>;
+    /// Color the canvas and show it in the window (a no-op without one).
+    fn present(&mut self, colors: &Colors) -> Result<()>;
 
-    /// Read back the current canvas as RGBA8 rows (what `present` shows).
-    fn snapshot(&mut self) -> Result<Vec<u8>>;
+    /// The canvas colored as `present` would show it, as RGBA8 rows.
+    fn snapshot(&mut self, colors: &Colors) -> Result<Vec<u8>>;
 
     /// Resample the canvas contents for a new view (see [`Reprojection`]).
     /// Pixels with no source become black.
     fn reproject(&mut self, xf: &Reprojection) -> Result<()>;
 
-    /// Render offscreen at `params.width` x `params.height`; returns RGBA8 rows.
-    fn capture(&mut self, params: &FrameParams, step: u32) -> Result<(Vec<u8>, FrameStats)>;
+    /// Render offscreen at `params.width` x `params.height`, colored with
+    /// `colors`; returns RGBA8 rows.
+    fn capture(&mut self, params: &FrameParams, step: u32, colors: &Colors) -> Result<(Vec<u8>, FrameStats)>;
 }
 
 /// Create the platform's renderer for a window.
@@ -156,9 +158,7 @@ pub struct GpuParams {
     pub width: u32,
     pub height: u32,
     pub max_iter: u32,
-    pub palette: u32,
     pub precision: u32,
-    pub color_density: f32,
     /// Number of reference orbit points bound at buffer(1) (Perturbation).
     pub ref_len: u32,
     /// Scale as floatexp (scale_m * 2^scale_e): below ~1e-38 it has no f32.
@@ -169,7 +169,6 @@ pub struct GpuParams {
     /// View center minus reference point, as complex floatexp (Perturbation).
     pub ref_off_m: [f32; 2],
     pub ref_off_e: i32,
-    pub _pad0: [u32; 2],
     /// Series approximation: start at iteration sa_n with dz = A * dc.
     pub sa_n: u32,
     pub sa_a_m: [f32; 2],
@@ -195,20 +194,17 @@ impl GpuParams {
             width: p.width,
             height: p.height,
             max_iter: p.max_iter,
-            palette: p.palette,
             precision: match p.precision {
                 Precision::F32 => 0,
                 Precision::DoubleFloat => 1,
                 Precision::Perturbation => 2,
             },
-            color_density: p.color_density,
             ref_len: p.reference.as_ref().map_or(0, |r| r.points.len() as u32),
             scale_m: scale_m as f32,
             scale_e,
             step: step.clamp(1, TILE),
             ref_off_m,
             ref_off_e,
-            _pad0: [0; 2],
             sa_n: p.series_n,
             sa_a_m: p.series_a.0,
             sa_a_e: p.series_a.1,
@@ -227,5 +223,28 @@ impl HasWindowHandle for NoWindow {
         &self,
     ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
         match *self {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+
+    /// Pins the uniform's layout to the shader's `Params`, where float2 is
+    /// 8-byte aligned: every float2 field must land on a multiple of 8.
+    #[test]
+    fn gpu_params_layout_matches_the_shader() {
+        let float2_fields = [
+            offset_of!(GpuParams, center_x),
+            offset_of!(GpuParams, center_y),
+            offset_of!(GpuParams, scale),
+            offset_of!(GpuParams, ref_off_m),
+            offset_of!(GpuParams, sa_a_m),
+        ];
+        assert!(float2_fields.iter().all(|o| o % 8 == 0), "{float2_fields:?}");
+        assert_eq!(offset_of!(GpuParams, ref_off_m), 56);
+        assert_eq!(offset_of!(GpuParams, sa_a_m), 72);
+        assert_eq!(size_of::<GpuParams>(), 88);
     }
 }

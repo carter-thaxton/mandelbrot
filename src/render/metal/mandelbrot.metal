@@ -20,22 +20,21 @@ struct Params {
     uint   width;
     uint   height;
     uint   max_iter;
-    uint   palette;
     uint   precision;
-    float  color_density;
     uint   ref_len;
     float  scale_m;    // scale as floatexp: scale_m * 2^scale_e
     int    scale_e;
     uint   step;       // sample every `step` pixels, filling step x step blocks
     float2 ref_off_m;  // view center - reference point, as complex floatexp
     int    ref_off_e;
-    uint   _pad0a;     // (two uints, not a uint2: keeps 4-byte alignment)
-    uint   _pad0b;
     uint   sa_n;       // series approximation: start at iteration sa_n...
     float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
     int    sa_a_e;
     uint   stats_only; // nonzero: gather statistics, write no pixels
 };
+
+/// Canvas value for samples that never escaped (in the set, or not computed).
+constant float INSIDE = -1.0;
 
 constant uint TILE = 16; // must match TILE in src/render/mod.rs
 
@@ -363,6 +362,9 @@ float3 palette(uint which, float t) {
 // Kernel
 // ---------------------------------------------------------------------------
 
+// Writes each sample's smooth iteration count mu (or INSIDE) to `out`, a
+// single-channel float canvas; `colorize` turns mu into colors when the
+// canvas is shown, so color changes never require recomputation.
 kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
                        device const RefPoint* ref         [[buffer(1)]],
@@ -407,16 +409,12 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         }
 
         if (!p.stats_only) {
-            float3 rgb = float3(0.0);
-            if (mu >= 0.0) {
-                float t = mu * 0.02 * p.color_density;
-                rgb = palette(p.palette, t);
-            }
+            float value = mu >= 0.0 ? mu : INSIDE;
             uint x1 = min(x0 + p.step, p.width);
             uint y1 = min(y0 + p.step, p.height);
             for (uint y = y0; y < y1; ++y) {
                 for (uint x = x0; x < x1; ++x) {
-                    out.write(float4(rgb, 1.0), uint2(x, y));
+                    out.write(float4(value), uint2(x, y));
                 }
             }
         }
@@ -450,22 +448,64 @@ struct Reprojection {
     uint   old_h;
 };
 
-kernel void reproject(texture2d<float, access::sample> src [[texture(0)]],
-                      texture2d<float, access::write>  dst [[texture(1)]],
-                      constant Reprojection& r             [[buffer(0)]],
-                      uint2 gid                            [[thread_position_in_grid]])
+/// Texel `q` of `src`, clamped to its edges.
+inline float texel(texture2d<float, access::read> src, int2 q) {
+    int2 last = int2(src.get_width(), src.get_height()) - 1;
+    return src.read(uint2(clamp(q, int2(0), last))).r;
+}
+
+kernel void reproject(texture2d<float, access::read>  src [[texture(0)]],
+                      texture2d<float, access::write> dst [[texture(1)]],
+                      constant Reprojection& r            [[buffer(0)]],
+                      uint2 gid                           [[thread_position_in_grid]])
 {
     uint2 size = uint2(dst.get_width(), dst.get_height());
     if (gid.x >= size.x || gid.y >= size.y) return;
 
     float2 old_size = float2(r.old_w, r.old_h);
     float2 u = 0.5 * old_size + (float2(gid) + 0.5 - 0.5 * float2(size)) * r.ratio + r.shift;
-    float4 c = float4(0.0, 0.0, 0.0, 1.0);
+    float value = INSIDE; // no source: drawn black until its tile is recomputed
     if (all(u >= 0.0) && all(u <= old_size)) {
-        // Bilinear; lands exactly on texel centers for whole-pixel pans, so
-        // those copy the old pixels unchanged.
-        constexpr sampler smp(coord::pixel, filter::linear, address::clamp_to_edge);
-        c = src.sample(smp, u);
+        // Bilinear in mu (by hand: float textures needn't support filtering).
+        // Whole-pixel pans land exactly on texel centers (f = 0), so they copy
+        // the old values unchanged.
+        float2 p = u - 0.5;
+        int2 i = int2(floor(p));
+        float2 f = p - float2(i);
+        float a = texel(src, i), b = texel(src, i + int2(1, 0));
+        float c = texel(src, i + int2(0, 1)), d = texel(src, i + int2(1, 1));
+        if (min(min(a, b), min(c, d)) < 0.0) {
+            // Next to the set's interior: blending with INSIDE would invent mu
+            // values (stray colors), so take the nearest texel instead.
+            value = texel(src, int2(floor(u)));
+        } else {
+            value = mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+        }
     }
-    dst.write(c, gid);
+    dst.write(float4(value), gid);
+}
+
+// ---------------------------------------------------------------------------
+// Colorize: mu canvas -> colors, every time the canvas is shown. Cheap (one
+// palette lookup per pixel), so colors can change every frame for free.
+// ---------------------------------------------------------------------------
+
+// Must match `GpuColors` in render/metal/mod.rs.
+struct Colors {
+    uint  palette;
+    float density;   // palette cycles per 50 iterations
+    float offset;    // palette phase, in cycles
+    uint  _pad;
+};
+
+kernel void colorize(texture2d<float, access::read>  mu  [[texture(0)]],
+                     texture2d<float, access::write> out [[texture(1)]],
+                     constant Colors& c                  [[buffer(0)]],
+                     uint2 gid                           [[thread_position_in_grid]])
+{
+    if (gid.x >= out.get_width() || gid.y >= out.get_height()) return;
+    // The window may briefly be larger than the canvas during a resize.
+    float m = gid.x < mu.get_width() && gid.y < mu.get_height() ? mu.read(gid).r : INSIDE;
+    float3 rgb = m >= 0.0 ? palette(c.palette, m * 0.02 * c.density + c.offset) : float3(0.0);
+    out.write(float4(rgb, 1.0), gid);
 }

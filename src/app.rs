@@ -53,7 +53,19 @@ fn parse_center(x: &str, y: &str) -> Option<(Fixed, Fixed)> {
     Some((Fixed::parse(x, frac)?, Fixed::parse(y, frac)?))
 }
 
-/// Everything a renderer needs to draw one frame.
+/// How iteration counts become colors. Applied each time the canvas is shown,
+/// so changing it never requires recomputing anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Colors {
+    pub palette: u32,
+    /// Palette cycles per 50 iterations.
+    pub density: f32,
+    /// Palette phase, in cycles.
+    pub offset: f32,
+}
+
+/// Everything a renderer needs to compute one frame (colors are separate:
+/// see [`Colors`]).
 #[derive(Clone)]
 pub struct FrameParams {
     /// Center rounded to f64 (all the direct f32/df64 paths can use).
@@ -63,10 +75,7 @@ pub struct FrameParams {
     pub width: u32,
     pub height: u32,
     pub max_iter: u32,
-    pub palette: u32,
     pub precision: Precision,
-    /// Palette cycles per 50 iterations.
-    pub color_density: f32,
     /// Reference orbit (Perturbation only). Renderers can use `Arc::ptr_eq`
     /// to skip re-uploading an unchanged orbit.
     pub reference: Option<Arc<ReferenceOrbit>>,
@@ -143,6 +152,8 @@ pub struct Explorer {
     pub precision_mode: PrecisionMode,
     pub palette: u32,
     pub color_density: f32,
+    /// Palette phase in cycles (see [`Colors::offset`]).
+    pub color_offset: f32,
     pub iter_limit: u32,
     /// Adjust `iter_limit` from GPU statistics (see [`Explorer::observe`]).
     pub auto_iter: bool,
@@ -173,6 +184,7 @@ impl Explorer {
             precision_mode: PrecisionMode::Auto,
             palette: 0,
             color_density: 1.0,
+            color_offset: 0.0,
             iter_limit: MIN_ITER,
             auto_iter: true,
             series_skip: true,
@@ -492,14 +504,16 @@ impl Explorer {
             width: self.width,
             height: self.height,
             max_iter: self.iter_limit,
-            palette: self.palette,
             precision,
-            color_density: self.color_density,
             reference,
             ref_offset,
             series_n,
             series_a,
         }
+    }
+
+    pub fn colors(&self) -> Colors {
+        Colors { palette: self.palette, density: self.color_density, offset: self.color_offset }
     }
 
     /// Center as decimal strings with enough digits to reproduce this view.

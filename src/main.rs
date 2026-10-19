@@ -198,7 +198,8 @@ impl App {
         let params = self.explorer.frame_params();
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let path = format!("mandelbrot-{secs}.png");
-        match renderer.capture(&params, 1).and_then(|(px, _)| write_png(&path, &params, &px)) {
+        let colors = self.explorer.colors();
+        match renderer.capture(&params, 1, &colors).and_then(|(px, _)| write_png(&path, &params, &px)) {
             Ok(()) => println!("saved {path}"),
             Err(err) => eprintln!("screenshot failed: {err}"),
         }
@@ -411,7 +412,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     let pixels = w as f64 * h as f64;
     let settle_step = (1..=4).rev().find(|s| pixels / (s * s) as f64 >= app::MIN_DECISION_SAMPLES as f64).unwrap_or(1);
     for _ in 0..8 {
-        let (_, stats) = renderer.capture(&explorer.frame_params(), settle_step)?;
+        let (_, stats) = renderer.capture(&explorer.frame_params(), settle_step, &explorer.colors())?;
         if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
             eprintln!("settle: limit {} -> {stats:?}", explorer.iter_limit);
         }
@@ -421,7 +422,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     }
     let settle_ms = start.elapsed().as_secs_f64() * 1000.0;
     let params = explorer.frame_params();
-    let (pixels, stats) = renderer.capture(&params, 1)?;
+    let (pixels, stats) = renderer.capture(&params, 1, &explorer.colors())?;
     println!(
         "{}  (settle {settle_ms:.0} ms, gpu {:.1} ms, total {:.1} ms)",
         explorer.hud(None, None),
