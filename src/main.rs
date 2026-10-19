@@ -15,14 +15,15 @@ use mandelbrot::render::{self, Renderer};
 
 const HELP: &str = "\
 Mandelbrot explorer
-  drag / two-finger scroll   pan
-  pinch / cmd+scroll / wheel zoom at cursor
+  drag / cmd+two-finger      pan
+  two-finger / pinch / wheel zoom at cursor
   = / -                      zoom in / out (center)
   arrow keys                 pan
   0-9                        fly to a saved place (0: home)
   cmd+1-9                    save the current place
   shift+0-9                  jump there instantly
   + / _                      flight speed up / down (also mid-flight)
+  space                      pause / resume a flight
   any navigation, or esc     stop a flight where it is
   [ / ]                      fewer / more iterations (switches to manual)
   a                          automatic iteration limit on / off
@@ -32,7 +33,7 @@ Mandelbrot explorer
   r                          reset view
   s                          save screenshot (PNG in current dir)
   c                          print location (full precision) as a --capture command
-  q / esc (if not flying)    quit
+  q / cmd+w / cmd+q          quit
 
 Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--iters N]
           [--density D] [--precision f32|df|perturb] [--no-skip]";
@@ -141,14 +142,27 @@ impl App {
         }
         let e = &mut self.explorer;
         match key {
-            Key::Named(NamedKey::Escape) if self.flight.is_some() => self.flight = None,
-            Key::Named(NamedKey::Escape) => event_loop.exit(),
+            Key::Named(NamedKey::Space) => match &mut self.flight {
+                Some(active) if active.flight.is_paused() => active.flight.resume(),
+                Some(active) => {
+                    active.flight.pause();
+                    active.last_tick = None; // so resuming doesn't count the pause as elapsed
+                }
+                None => return,
+            },
+            // Esc only ever stops a flight (quitting is q / cmd+w / cmd+q).
+            Key::Named(NamedKey::Escape) => {
+                if self.flight.take().is_none() {
+                    return;
+                }
+            }
             Key::Named(NamedKey::ArrowLeft) => e.pan_fraction(0.1, 0.0),
             Key::Named(NamedKey::ArrowRight) => e.pan_fraction(-0.1, 0.0),
             Key::Named(NamedKey::ArrowUp) => e.pan_fraction(0.0, 0.1),
             Key::Named(NamedKey::ArrowDown) => e.pan_fraction(0.0, -0.1),
             Key::Character(s) => match s.as_str() {
                 "q" | "Q" => event_loop.exit(),
+                "w" | "W" if self.modifiers.super_key() => event_loop.exit(),
                 "=" => e.zoom_at_center(2.0),
                 "-" => e.zoom_at_center(0.5),
                 "+" => return self.set_flight_speed(1.5),
@@ -250,10 +264,11 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseWheel { delta, .. } => {
                 self.flight = None;
-                let zoom_modifier = self.modifiers.super_key() || self.modifiers.control_key();
+                let pan_modifier = self.modifiers.super_key() || self.modifiers.control_key();
                 match delta {
-                    // Trackpad: two-finger scroll pans; with cmd/ctrl it zooms.
-                    MouseScrollDelta::PixelDelta(d) if !zoom_modifier => {
+                    // Trackpad: two-finger scroll zooms (one-handed driving,
+                    // since dragging already pans); with cmd/ctrl it pans.
+                    MouseScrollDelta::PixelDelta(d) if pan_modifier => {
                         self.explorer.pan_pixels(d.x, d.y);
                     }
                     MouseScrollDelta::PixelDelta(d) => {
@@ -276,7 +291,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let Some(r) = self.renderer.as_mut() else { return };
                 // A flight moves the view by however much time has passed.
-                if let Some(active) = &mut self.flight {
+                if let Some(active) = self.flight.as_mut().filter(|a| !a.flight.is_paused()) {
                     let now = Instant::now();
                     let dt = active.last_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
                     active.last_tick = Some(now);
@@ -295,14 +310,19 @@ impl ApplicationHandler for App {
                         false
                     }
                 };
-                if more || self.flight.is_some() {
+                let flying = self.flight.as_ref().is_some_and(|a| !a.flight.is_paused());
+                if more || flying {
                     self.request_redraw();
                 }
                 if let Some(w) = &self.window {
                     let mut title = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
                     if let Some(active) = &self.flight {
                         let dest = if active.slot == HOME { "home".to_string() } else { active.slot.to_string() };
-                        title += &format!("  |  flying to {dest} at {:.2} decades/s", active.flight.speed);
+                        title += &if active.flight.is_paused() {
+                            format!("  |  flight to {dest} paused (space resumes)")
+                        } else {
+                            format!("  |  flying to {dest} at {:.2} decades/s", active.flight.speed)
+                        };
                     }
                     w.set_title(&title);
                 }

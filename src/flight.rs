@@ -109,7 +109,10 @@ pub struct Flight {
     /// Total path length, and how far along it we are.
     length: f64,
     travelled: f64,
+    /// Seconds since the flight started moving (or last resumed): drives the
+    /// start ramp.
     elapsed: f64,
+    paused: bool,
     /// ln of the widest view along the path, and of the current view.
     ln_w_apex: f64,
     ln_w: f64,
@@ -160,6 +163,7 @@ impl Flight {
             length,
             travelled: 0.0,
             elapsed: 0.0,
+            paused: false,
             ln_w_apex,
             ln_w: ln_w0,
             speed,
@@ -193,9 +197,30 @@ impl Flight {
         ramp_up.min(ramp_down).min(gravity).min(cruise).max(cruise * MIN_SPEED_FRACTION)
     }
 
-    /// Advance by `dt` seconds of wall-clock time; returns the place to show
-    /// and whether the flight has arrived.
+    /// Stop where it is; [`Flight::advance`] then holds still.
+    pub fn pause(&mut self) {
+        self.paused = true;
+    }
+
+    /// Continue, speeding up from rest as at the start.
+    pub fn resume(&mut self) {
+        if self.paused {
+            self.paused = false;
+            self.elapsed = 0.0;
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Advance by `dt` seconds of wall-clock time (none while paused);
+    /// returns the place to show and whether the flight has arrived.
     pub fn advance(&mut self, dt: f64) -> (Place, bool) {
+        if self.paused {
+            let place = if self.travelled == 0.0 { self.from.clone() } else { self.at(self.travelled).0 };
+            return (place, false);
+        }
         let dt = dt.clamp(0.0, MAX_STEP_SECONDS);
         self.elapsed += dt;
         self.travelled += self.current_speed() * dt;
@@ -401,6 +426,41 @@ mod tests {
                 println!("{t:>6.2} {depth:>18.2} {v:>14.2}");
             }
         }
+    }
+
+    #[test]
+    fn pause_holds_still_and_resume_speeds_up_from_rest() {
+        let from = place("-0.75", "0", 2.6);
+        let to = place("0", "1", 1e-30);
+        let mut f = Flight::new(from.clone(), to.clone(), 2.0);
+        let mut path = vec![from];
+        for _ in 0..300 {
+            path.push(f.advance(1.0 / 60.0).0);
+        }
+        f.pause();
+        assert!(f.is_paused());
+        let held = f.travelled;
+        for _ in 0..100 {
+            let (p, done) = f.advance(1.0 / 60.0);
+            assert!(!done);
+            assert_eq!(&p, path.last().unwrap(), "moved while paused");
+        }
+        assert_eq!(f.travelled, held);
+
+        f.resume();
+        assert!(!f.is_paused());
+        // The first frames back are slow (start ramp), not a lurch at cruise.
+        f.advance(1.0 / 60.0);
+        assert!((f.travelled - held) * 60.0 < 0.1 * f.cruise(), "resumed too fast");
+        loop {
+            let (p, done) = f.advance(1.0 / 60.0);
+            path.push(p);
+            if done {
+                break;
+            }
+        }
+        assert_eq!(path.last().unwrap(), &to);
+        assert_smooth(&path, 0.5);
     }
 
     #[test]
