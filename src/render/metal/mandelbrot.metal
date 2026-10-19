@@ -343,6 +343,10 @@ float3 classic_palette(float t) {
     return col[5];
 }
 
+// Every palette must repeat after PALETTE_PERIOD (10) cycles of t, so color
+// cycling can wrap its offset seamlessly: cosine frequencies × 10 must be
+// whole numbers (Fire's 0.7 and 0.4 are why it's 10, not 1). Checked by the
+// `every_palette_repeats_after_the_palette_period` GPU test.
 float3 palette(uint which, float t) {
     switch (which) {
         case 0: return classic_palette(t);

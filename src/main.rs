@@ -29,6 +29,9 @@ Mandelbrot explorer
   [ / ]                      fewer / more iterations (switches to manual)
   a                          automatic iteration limit on / off
   , / .                      color density down / up
+  o                          color cycling on / off
+  { / }                      color cycling slower / faster
+  ; / '                      shift colors back / forward
   p / shift+p                next / previous palette
   m                          precision: auto -> f32 -> df64 -> perturb
   r                          reset view
@@ -49,6 +52,8 @@ struct App {
     flight: Option<ActiveFlight>,
     /// Cruising speed for flights, zoom decades per second.
     flight_speed: f64,
+    /// When color cycling last advanced (None: restart timing).
+    last_color_tick: Option<Instant>,
 }
 
 struct ActiveFlight {
@@ -75,6 +80,7 @@ impl App {
             bookmarks: Bookmarks::with_presets(),
             flight: None,
             flight_speed: flight::DEFAULT_SPEED,
+            last_color_tick: None,
         }
     }
 
@@ -179,7 +185,16 @@ impl App {
                 "r" | "R" => {
                     e.reset_view();
                     e.color_density = 1.0;
+                    e.color_offset = 0.0;
                 }
+                "o" | "O" => {
+                    e.color_cycling = !e.color_cycling;
+                    self.last_color_tick = None;
+                }
+                "{" => e.scale_color_speed(1.0 / 1.5),
+                "}" => e.scale_color_speed(1.5),
+                ";" => e.shift_colors(-1.0 / 32.0),
+                "'" => e.shift_colors(1.0 / 32.0),
                 "s" | "S" => self.save_screenshot(),
                 "c" | "C" => {
                     let (x, y) = e.center_strings();
@@ -292,6 +307,13 @@ impl ApplicationHandler for App {
 
             WindowEvent::RedrawRequested => {
                 let Some(r) = self.renderer.as_mut() else { return };
+                // Color cycling moves the palette by however much time has passed.
+                if self.explorer.color_cycling {
+                    let now = Instant::now();
+                    let dt = self.last_color_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+                    self.last_color_tick = Some(now);
+                    self.explorer.advance_colors(dt.min(0.1));
+                }
                 // A flight moves the view by however much time has passed.
                 if let Some(active) = self.flight.as_mut().filter(|a| !a.flight.is_paused()) {
                     let now = Instant::now();
@@ -313,7 +335,7 @@ impl ApplicationHandler for App {
                     }
                 };
                 let flying = self.flight.as_ref().is_some_and(|a| !a.flight.is_paused());
-                if more || flying {
+                if more || flying || self.explorer.color_cycling {
                     self.request_redraw();
                 }
                 if let Some(w) = &self.window {

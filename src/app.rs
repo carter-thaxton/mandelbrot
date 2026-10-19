@@ -107,6 +107,16 @@ pub const MIN_ITER: u32 = 256;
 pub const MIN_DECISION_SAMPLES: u64 = 20_000;
 pub const MAX_ITER: u32 = 200_000;
 
+/// Initial color cycling speed, in palette cycles per second: slow enough to
+/// read as drifting rather than flashing.
+pub const DEFAULT_COLOR_SPEED: f32 = 0.05;
+
+/// Every palette repeats after this many cycles, so the color offset can wrap
+/// here seamlessly. (Not 1: Fire's channel frequencies are 1, 0.7 and 0.4,
+/// which only all complete whole waves after 10 cycles. Palettes in the
+/// shader must keep frequency × 10 whole.)
+pub const PALETTE_PERIOD: f32 = 10.0;
+
 /// In auto mode, each zoom by a factor f scales the iteration limit by
 /// f^ITERS_PER_ZOOM, so it keeps roughly in step while zooming; GPU
 /// statistics then correct it for the actual location. Fitted to the seahorse
@@ -154,6 +164,10 @@ pub struct Explorer {
     pub color_density: f32,
     /// Palette phase in cycles (see [`Colors::offset`]).
     pub color_offset: f32,
+    /// Advance `color_offset` over time (see [`Explorer::advance_colors`]).
+    pub color_cycling: bool,
+    /// Cycling speed, palette cycles per second.
+    pub color_speed: f32,
     pub iter_limit: u32,
     /// Adjust `iter_limit` from GPU statistics (see [`Explorer::observe`]).
     pub auto_iter: bool,
@@ -185,6 +199,8 @@ impl Explorer {
             palette: 0,
             color_density: 1.0,
             color_offset: 0.0,
+            color_cycling: false,
+            color_speed: DEFAULT_COLOR_SPEED,
             iter_limit: MIN_ITER,
             auto_iter: true,
             series_skip: true,
@@ -512,6 +528,24 @@ impl Explorer {
         }
     }
 
+    /// Move the palette phase by `cycles`, kept in [0, PALETTE_PERIOD): every
+    /// palette repeats over that range, so wrapping is seamless, and f32
+    /// stays precise however long colors cycle.
+    pub fn shift_colors(&mut self, cycles: f32) {
+        self.color_offset = (self.color_offset + cycles).rem_euclid(PALETTE_PERIOD);
+    }
+
+    /// Advance color cycling by `dt` seconds (nothing unless cycling).
+    pub fn advance_colors(&mut self, dt: f64) {
+        if self.color_cycling {
+            self.shift_colors(self.color_speed * dt as f32);
+        }
+    }
+
+    pub fn scale_color_speed(&mut self, factor: f32) {
+        self.color_speed = (self.color_speed * factor).clamp(0.001, 10.0);
+    }
+
     pub fn colors(&self) -> Colors {
         Colors { palette: self.palette, density: self.color_density, offset: self.color_offset }
     }
@@ -551,10 +585,11 @@ impl Explorer {
             (None, Some(ms)) => format!("  |  {ms:.0} ms"),
             (None, None) => String::new(),
         };
+        let cycling = if self.color_cycling { format!(", cycling {:.3}/s", self.color_speed) } else { String::new() };
         // The title bar can't show 35 digits usefully; `c` prints them all.
         let (cx, cy) = (self.center.0.to_f64(), self.center.1.to_f64());
         format!(
-            "Mandelbrot  |  {cx:+.15}, {cy:+.15}  |  zoom {:.3e}  |  {iters}  |  {mode}{reference}  |  {}{status}",
+            "Mandelbrot  |  {cx:+.15}, {cy:+.15}  |  zoom {:.3e}  |  {iters}  |  {mode}{reference}  |  {}{cycling}{status}",
             self.zoom(),
             PALETTE_NAMES[self.palette as usize],
         )
@@ -679,6 +714,25 @@ mod tests {
         e.iter_limit = 50_000;
         e.go_to(&e.home_place());
         assert!(e.iter_limit < 50_000 / 100, "{}", e.iter_limit);
+    }
+
+    #[test]
+    fn color_cycling_advances_only_when_on_and_wraps() {
+        let mut e = Explorer::new(800, 600);
+        e.advance_colors(10.0);
+        assert_eq!(e.color_offset, 0.0, "moved while off");
+        e.color_cycling = true;
+        e.color_speed = 0.25;
+        e.advance_colors(1.0);
+        assert!((e.color_offset - 0.25).abs() < 1e-6);
+        // Wraps into [0, PALETTE_PERIOD) after many cycles, forward and back.
+        e.advance_colors(1000.0);
+        assert!((0.0..PALETTE_PERIOD).contains(&e.color_offset), "{}", e.color_offset);
+        assert!((e.color_offset - 0.25).abs() < 1e-3, "{}", e.color_offset);
+        e.shift_colors(-0.5);
+        assert!((e.color_offset - (PALETTE_PERIOD - 0.25)).abs() < 1e-3, "{}", e.color_offset);
+        // The offset reaches the colors the renderer uses.
+        assert_eq!(e.colors().offset, e.color_offset);
     }
 
     #[test]

@@ -102,7 +102,17 @@ fn color_changes_only_re_present() {
     let (mut s, mut r) = (Scheduler::default(), MockRenderer::settled());
     run_to_completion(&mut s, &mut e, &mut r);
 
-    for change in [|e: &mut Explorer| e.cycle_palette(true), |e: &mut Explorer| e.color_density *= 1.25] {
+    let changes: [fn(&mut Explorer); 4] = [
+        |e| e.cycle_palette(true),
+        |e| e.color_density *= 1.25,
+        |e| e.shift_colors(1.0 / 32.0),
+        // A frame of color cycling.
+        |e| {
+            e.color_cycling = true;
+            e.advance_colors(1.0 / 60.0);
+        },
+    ];
+    for change in changes {
         change(&mut e);
         let before = r.log.len();
         // One step re-presents, with nothing to compute and nothing left to do.

@@ -5,7 +5,7 @@
 //! Also holds an ignored measurement, `simulated_deep_zoom`:
 //! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
 
-use mandelbrot::app::{Colors, Explorer, Place};
+use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place};
 use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Output, Renderer, TileBatch};
@@ -139,12 +139,25 @@ fn colors_apply_at_present_time() {
         let black = |px: &[u8]| px.chunks(4).map(|p| p[..3] == [0, 0, 0]).collect::<Vec<_>>();
         assert_eq!(black(&image), black(&other), "{colors:?} changed the interior");
     }
-    // A whole cycle of offset is the same image (up to rounding).
-    let cycled = r.snapshot(&Colors { offset: 1.0, ..base }).unwrap();
-    assert!(differing(&image, &cycled) < 0.001);
     // Matches a fresh capture with the same colors.
     let (fresh, _) = r.capture(&e.frame_params(), 1, &base).unwrap();
     assert_eq!(image, fresh);
+}
+
+/// Color cycling wraps its offset at PALETTE_PERIOD, which is only seamless
+/// if every palette repeats there (one that didn't would visibly jump).
+#[test]
+fn every_palette_repeats_after_the_palette_period() {
+    let (w, h) = (160, 120);
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    for palette in 0..PALETTE_COUNT {
+        let colors = |offset| Colors { palette, density: 1.0, offset };
+        let image = r.snapshot(&colors(0.0)).unwrap();
+        let wrapped = r.snapshot(&colors(PALETTE_PERIOD)).unwrap();
+        assert!(differing(&image, &wrapped) < 0.001, "palette {palette} doesn't repeat after {PALETTE_PERIOD} cycles");
+    }
 }
 
 /// Fraction of pure black (never-escaped) pixels, and number of distinct colors.
