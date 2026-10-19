@@ -14,7 +14,7 @@ use std::ops::{Add, AddAssign, Mul, Neg, Sub, SubAssign};
 /// last limb is the integer part.
 ///
 /// Invariant: zero is never negative, so the derived `PartialEq` is value
-/// equality. Every operation ends with [`Fixed::normalize`].
+/// equality. Every operation ends with `normalize`.
 ///
 /// `Clone` is implemented by hand so `clone_from` can reuse the allocation;
 /// a new field must be added there too (`clone_from` would not fail to compile).

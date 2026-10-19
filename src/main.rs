@@ -1,13 +1,15 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use mandelbrot::app::{self, Explorer, Precision, PrecisionMode};
+use mandelbrot::bookmarks::{Bookmarks, HOME};
+use mandelbrot::flight::{self, Flight};
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Renderer};
 
@@ -15,8 +17,13 @@ const HELP: &str = "\
 Mandelbrot explorer
   drag / two-finger scroll   pan
   pinch / cmd+scroll / wheel zoom at cursor
-  + / -                      zoom in / out (center)
+  = / -                      zoom in / out (center)
   arrow keys                 pan
+  0-9                        fly to a saved place (0: home)
+  cmd+1-9                    save the current place
+  shift+0-9                  jump there instantly
+  + / _                      flight speed up / down (also mid-flight)
+  any navigation, or esc     stop a flight where it is
   [ / ]                      fewer / more iterations (switches to manual)
   a                          automatic iteration limit on / off
   , / .                      color density down / up
@@ -25,7 +32,7 @@ Mandelbrot explorer
   r                          reset view
   s                          save screenshot (PNG in current dir)
   c                          print location (full precision) as a --capture command
-  esc / q                    quit
+  q / esc (if not flying)    quit
 
 Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [--iters N]
           [--density D] [--precision f32|df|perturb] [--no-skip]";
@@ -36,6 +43,23 @@ struct App {
     explorer: Explorer,
     modifiers: ModifiersState,
     scheduler: Scheduler,
+    bookmarks: Bookmarks,
+    flight: Option<ActiveFlight>,
+    /// Cruising speed for flights, zoom decades per second.
+    flight_speed: f64,
+}
+
+struct ActiveFlight {
+    flight: Flight,
+    slot: u8,
+    last_tick: Option<Instant>,
+}
+
+/// The bookmark slot of a number-row key.
+fn digit_slot(code: KeyCode) -> Option<u8> {
+    use KeyCode::*;
+    let digits = [Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9];
+    digits.iter().position(|&d| d == code).map(|i| i as u8)
 }
 
 impl App {
@@ -46,6 +70,9 @@ impl App {
             explorer: Explorer::new(1, 1),
             modifiers: ModifiersState::empty(),
             scheduler: Scheduler::default(),
+            bookmarks: Bookmarks::default(),
+            flight: None,
+            flight_speed: flight::DEFAULT_SPEED,
         }
     }
 
@@ -60,9 +87,61 @@ impl App {
         self.request_redraw();
     }
 
-    fn handle_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+    /// Number keys: save (cmd), jump (shift), or fly to a place.
+    fn handle_slot(&mut self, slot: u8) {
+        if self.modifiers.super_key() {
+            if self.bookmarks.save(slot, self.explorer.place()) {
+                println!("saved place {slot}");
+            } else {
+                println!("0 is home and can't be changed");
+            }
+            return;
+        }
+        let target = if slot == HOME {
+            self.explorer.home_place()
+        } else if let Some(place) = self.bookmarks.get(slot) {
+            place.clone()
+        } else {
+            println!("nothing saved in {slot} yet (cmd+{slot} saves the current place)");
+            return;
+        };
+        if self.modifiers.shift_key() {
+            self.flight = None;
+            self.explorer.go_to(&target);
+        } else {
+            let flight = Flight::new(self.explorer.place(), target, self.flight_speed);
+            self.flight = Some(ActiveFlight { flight, slot, last_tick: None });
+        }
+        self.invalidate();
+    }
+
+    fn set_flight_speed(&mut self, factor: f64) {
+        self.flight_speed = (self.flight_speed * factor).clamp(0.1, 100.0);
+        match &mut self.flight {
+            Some(active) => active.flight.speed = self.flight_speed,
+            None => println!("flight speed {:.2} decades/s", self.flight_speed),
+        }
+    }
+
+    fn handle_key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
+        if let PhysicalKey::Code(code) = event.physical_key
+            && let Some(slot) = digit_slot(code)
+        {
+            self.handle_slot(slot);
+            return;
+        }
+        let key = &event.logical_key;
+        // Manual navigation takes over from a flight, leaving the view where it is.
+        let navigates = matches!(
+            key,
+            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::ArrowUp | NamedKey::ArrowDown)
+        ) || matches!(key, Key::Character(c) if matches!(c.as_str(), "=" | "-" | "r" | "R"));
+        if navigates {
+            self.flight = None;
+        }
         let e = &mut self.explorer;
         match key {
+            Key::Named(NamedKey::Escape) if self.flight.is_some() => self.flight = None,
             Key::Named(NamedKey::Escape) => event_loop.exit(),
             Key::Named(NamedKey::ArrowLeft) => e.pan_fraction(0.1, 0.0),
             Key::Named(NamedKey::ArrowRight) => e.pan_fraction(-0.1, 0.0),
@@ -70,8 +149,10 @@ impl App {
             Key::Named(NamedKey::ArrowDown) => e.pan_fraction(0.0, -0.1),
             Key::Character(s) => match s.as_str() {
                 "q" | "Q" => event_loop.exit(),
-                "=" | "+" => e.zoom_at_center(2.0),
-                "-" | "_" => e.zoom_at_center(0.5),
+                "=" => e.zoom_at_center(2.0),
+                "-" => e.zoom_at_center(0.5),
+                "+" => return self.set_flight_speed(1.5),
+                "_" => return self.set_flight_speed(1.0 / 1.5),
                 "[" => e.scale_iter_limit(1.0 / 1.5),
                 "]" => e.scale_iter_limit(1.5),
                 "a" | "A" => e.auto_iter = !e.auto_iter,
@@ -148,7 +229,7 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
 
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                self.handle_key(&event.logical_key, event_loop);
+                self.handle_key(&event, event_loop);
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -159,12 +240,16 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 match state {
-                    ElementState::Pressed => self.explorer.begin_drag(),
+                    ElementState::Pressed => {
+                        self.flight = None; // grabbing the view stops a flight
+                        self.explorer.begin_drag();
+                    }
                     ElementState::Released => self.explorer.end_drag(),
                 }
             }
 
             WindowEvent::MouseWheel { delta, .. } => {
+                self.flight = None;
                 let zoom_modifier = self.modifiers.super_key() || self.modifiers.control_key();
                 match delta {
                     // Trackpad: two-finger scroll pans; with cmd/ctrl it zooms.
@@ -183,22 +268,43 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::PinchGesture { delta, .. } => {
+                self.flight = None;
                 self.explorer.zoom_at_cursor(delta.exp());
                 self.invalidate();
             }
 
             WindowEvent::RedrawRequested => {
                 let Some(r) = self.renderer.as_mut() else { return };
+                // A flight moves the view by however much time has passed.
+                if let Some(active) = &mut self.flight {
+                    let now = Instant::now();
+                    let dt = active.last_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+                    active.last_tick = Some(now);
+                    let (place, arrived) = active.flight.advance(dt);
+                    self.explorer.go_to(&place);
+                    if arrived {
+                        self.flight = None;
+                    }
+                }
                 // One budget-sized slice of work per display refresh; input
                 // that arrives in between invalidates the rest.
-                match self.scheduler.step(&mut self.explorer, r.as_mut()) {
-                    Ok(true) => self.request_redraw(),
-                    Ok(false) => {}
-                    Err(err) => eprintln!("render failed: {err}"),
+                let more = match self.scheduler.step(&mut self.explorer, r.as_mut()) {
+                    Ok(more) => more,
+                    Err(err) => {
+                        eprintln!("render failed: {err}");
+                        false
+                    }
+                };
+                if more || self.flight.is_some() {
+                    self.request_redraw();
                 }
                 if let Some(w) = &self.window {
-                    let hud = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
-                    w.set_title(&hud);
+                    let mut title = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
+                    if let Some(active) = &self.flight {
+                        let dest = if active.slot == HOME { "home".to_string() } else { active.slot.to_string() };
+                        title += &format!("  |  flying to {dest} at {:.2} decades/s", active.flight.speed);
+                    }
+                    w.set_title(&title);
                 }
             }
 

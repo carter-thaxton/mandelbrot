@@ -30,6 +30,15 @@ pub enum PrecisionMode {
     Forced(Precision),
 }
 
+/// A location in the plane and how much of it is visible: everything needed
+/// to return to a view, independent of window size (bookmarks, flights).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Place {
+    pub center: (Fixed, Fixed),
+    /// Height of the view in complex-plane units.
+    pub span: f64,
+}
+
 /// Everything a renderer needs to draw one frame.
 #[derive(Clone)]
 pub struct FrameParams {
@@ -171,6 +180,49 @@ impl Explorer {
         self.iter_limit = self.estimate_iter();
     }
 
+    /// The current view as a window-size-independent [`Place`].
+    pub fn place(&self) -> Place {
+        Place { center: self.center.clone(), span: self.scale * self.height as f64 }
+    }
+
+    /// The starting view.
+    pub fn home_place(&self) -> Place {
+        let frac = frac_limbs_for_scale(self.home_scale());
+        Place {
+            center: (Fixed::from_f64(HOME_CENTER.0, frac), Fixed::from_f64(HOME_CENTER.1, frac)),
+            span: HOME_SPAN,
+        }
+    }
+
+    /// Show `place`. Only the view changes (not colors or iteration mode);
+    /// in auto mode the iteration limit follows the depth change, as when
+    /// zooming.
+    pub fn go_to(&mut self, place: &Place) {
+        let new_scale = (place.span / self.height as f64).clamp(MIN_SCALE, self.home_scale() * 4.0);
+        let zoom_factor = self.scale / new_scale;
+        self.scale = new_scale;
+        let frac = |c: &Fixed| frac_limbs_for_scale(new_scale).max(c.frac_limbs());
+        self.center = (
+            place.center.0.with_frac_limbs(frac(&place.center.0)),
+            place.center.1.with_frac_limbs(frac(&place.center.1)),
+        );
+        self.pan_remainder = (0.0, 0.0);
+        self.track_depth(zoom_factor);
+    }
+
+    /// In auto mode, scale the iteration limit with a zoom by `factor` (> 1
+    /// zooms in), in >= 5% steps.
+    fn track_depth(&mut self, factor: f64) {
+        if self.auto_iter {
+            self.iter_drift *= factor.powf(ITERS_PER_ZOOM);
+            if !(1.0 / 1.05..=1.05).contains(&self.iter_drift) {
+                let n = self.iter_limit as f64 * self.iter_drift;
+                self.iter_limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
+                self.iter_drift = 1.0;
+            }
+        }
+    }
+
     /// Set the center from decimal strings (arbitrary precision).
     pub fn set_center_str(&mut self, x: &str, y: &str) -> Option<()> {
         // ~3.3 bits per decimal digit; keep everything that was typed.
@@ -283,14 +335,7 @@ impl Explorer {
         let k = new_scale / self.scale;
         self.scale = new_scale;
         self.pan_remainder = (0.0, 0.0);
-        if self.auto_iter {
-            self.iter_drift *= k.recip().powf(ITERS_PER_ZOOM);
-            if !(1.0 / 1.05..=1.05).contains(&self.iter_drift) {
-                let n = self.iter_limit as f64 * self.iter_drift;
-                self.iter_limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
-                self.iter_drift = 1.0;
-            }
-        }
+        self.track_depth(k.recip());
         self.shift_center(ox * (1.0 - k), oy * (1.0 - k));
     }
 
@@ -557,6 +602,36 @@ mod tests {
         e.set_iter_limit(500);
         e.zoom_at_center(1e5);
         assert_eq!(e.iter_limit, 500);
+    }
+
+    #[test]
+    fn place_round_trips_across_window_sizes() {
+        let mut e = Explorer::new(800, 600);
+        e.set_center_str("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
+        e.zoom_at_center(1e25);
+        let saved = e.place();
+        // Same place in a window twice as tall: same region, half the scale.
+        let mut tall = Explorer::new(800, 1200);
+        tall.go_to(&saved);
+        assert_eq!(tall.place().span, saved.span);
+        assert!((tall.scale / e.scale - 0.5).abs() < 1e-12);
+        // (Fixed's == compares representation too: compare values.)
+        assert_eq!((&tall.center.0 - &saved.center.0).to_f64(), 0.0);
+        assert_eq!((&tall.center.1 - &saved.center.1).to_f64(), 0.0);
+        // Coming back home.
+        tall.go_to(&tall.home_place());
+        assert_eq!(tall.zoom(), 1.0);
+    }
+
+    #[test]
+    fn go_to_grows_precision_for_deep_places() {
+        let mut e = Explorer::new(800, 600);
+        let mut deep = e.home_place();
+        deep.span = 1e-150;
+        e.go_to(&deep);
+        assert!(e.center.0.frac_limbs() >= frac_limbs_for_scale(e.scale));
+        // Auto iterations follow the depth, as zooming does.
+        assert!(e.iter_limit > e.estimate_iter() / 4, "{}", e.iter_limit);
     }
 
     #[test]

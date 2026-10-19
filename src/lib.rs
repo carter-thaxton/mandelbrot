@@ -6,6 +6,8 @@
 //! - [`progressive`]: schedules GPU work into budget-sized, reusable tiles
 //! - [`render`]: the backend-agnostic [`render::Renderer`] interface and the
 //!   Metal backend
+//! - [`bookmarks`], [`flight`]: saved places and smooth zoom-and-pan flights
+//!   between them
 //! - [`perturb`], [`bigfixed`]: deep-zoom math (reference orbits, series
 //!   approximation, arbitrary-precision fixed point)
 //!
@@ -14,6 +16,8 @@
 
 pub mod app;
 pub mod bigfixed;
+pub mod bookmarks;
+pub mod flight;
 pub mod perturb;
 pub mod progressive;
 pub mod render;
