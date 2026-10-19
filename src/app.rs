@@ -39,6 +39,20 @@ pub struct Place {
     pub span: f64,
 }
 
+impl Place {
+    /// A place from exact decimal coordinates, keeping every digit given.
+    pub fn parse(x: &str, y: &str, span: f64) -> Option<Place> {
+        Some(Place { center: parse_center(x, y)?, span })
+    }
+}
+
+/// Decimal strings to a center, with enough precision for every digit
+/// (~3.3 bits each) and at least 512 bits.
+fn parse_center(x: &str, y: &str) -> Option<(Fixed, Fixed)> {
+    let frac = (x.len().max(y.len()) * 4).div_ceil(64).max(8);
+    Some((Fixed::parse(x, frac)?, Fixed::parse(y, frac)?))
+}
+
 /// Everything a renderer needs to draw one frame.
 #[derive(Clone)]
 pub struct FrameParams {
@@ -225,9 +239,7 @@ impl Explorer {
 
     /// Set the center from decimal strings (arbitrary precision).
     pub fn set_center_str(&mut self, x: &str, y: &str) -> Option<()> {
-        // ~3.3 bits per decimal digit; keep everything that was typed.
-        let frac = (x.len().max(y.len()) * 4).div_ceil(64).max(8);
-        self.center = (Fixed::parse(x, frac)?, Fixed::parse(y, frac)?);
+        self.center = parse_center(x, y)?;
         Some(())
     }
 

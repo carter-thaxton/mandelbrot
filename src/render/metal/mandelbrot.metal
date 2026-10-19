@@ -223,8 +223,12 @@ inline bool cfe_l1_less(cfe a, cfe b) {
 //             thousand iterations at very deep zoom; skipped entirely above
 //             ~1e30 since dz starts out large enough)
 //   fast:     plain f32, as long as |dz| stays above 2^-110
-// dc may underflow to 0 in the fast phase; by then it is ~1e-7 or less of dz,
-// i.e. below f32 precision anyway.
+// dc may underflow to 0 in the fast phase. That's harmless while 2Z·dz
+// dominates the step, but not where the reference passes through ~0 (a
+// nucleus, every period): there the step is just dz² + dc, which can be far
+// too small for f32 and would round to exactly 0, leaving the pixel stuck on
+// the reference's periodic orbit forever. So a fast step whose result would
+// be that small is not taken; the extended phase redoes it with dc intact.
 // ---------------------------------------------------------------------------
 
 // Must match `RefPoint` in perturb.rs.
@@ -276,7 +280,15 @@ float iterate_perturb(cfe dc, device const RefPoint* ref, uint ref_len, uint max
         } else {
             for (; n < max_iter; ++n) {
                 float2 t = 2.0 * ref[m].z + dz;
-                dz = float2(t.x * dz.x - t.y * dz.y, t.x * dz.y + t.y * dz.x) + dcf;
+                float2 next = float2(t.x * dz.x - t.y * dz.y, t.x * dz.y + t.y * dz.x) + dcf;
+                if (abs(next.x) + abs(next.y) < FAST_TO_EXTENDED) {
+                    // Too small for f32: take this step in floatexp instead
+                    // (dz itself is still a normal f32, so this is exact).
+                    dzx = cfe_make(dz, 0);
+                    extended = true;
+                    break;
+                }
+                dz = next;
                 ++m;
 
                 float2 z = ref[m].z + dz;

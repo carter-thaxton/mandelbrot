@@ -19,7 +19,8 @@ Mandelbrot explorer
   two-finger / pinch / wheel zoom at cursor
   = / -                      zoom in / out (center)
   arrow keys                 pan
-  0-9                        fly to a saved place (0: home)
+  0-9                        fly to a saved place (0: home; 1-9 start
+                             with deep presets, shallow to deep)
   cmd+1-9                    save the current place
   shift+0-9                  jump there instantly
   + / _                      flight speed up / down (also mid-flight)
@@ -71,7 +72,7 @@ impl App {
             explorer: Explorer::new(1, 1),
             modifiers: ModifiersState::empty(),
             scheduler: Scheduler::default(),
-            bookmarks: Bookmarks::default(),
+            bookmarks: Bookmarks::with_presets(),
             flight: None,
             flight_speed: flight::DEFAULT_SPEED,
         }
@@ -317,7 +318,11 @@ impl ApplicationHandler for App {
                 if let Some(w) = &self.window {
                     let mut title = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
                     if let Some(active) = &self.flight {
-                        let dest = if active.slot == HOME { "home".to_string() } else { active.slot.to_string() };
+                        let dest = match (active.slot, self.bookmarks.name(active.slot)) {
+                            (HOME, _) => "home".to_string(),
+                            (slot, Some(name)) => format!("{slot} ({name})"),
+                            (slot, None) => slot.to_string(),
+                        };
                         title += &if active.flight.is_paused() {
                             format!("  |  flight to {dest} paused (space resumes)")
                         } else {
@@ -401,9 +406,12 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     let mut renderer = render::create_headless()?;
     let start = std::time::Instant::now();
     // Settle the automatic iteration limit on cheap coarse passes, as the
-    // interactive preview does.
+    // interactive preview does: as coarse as possible while still giving
+    // enough samples to decide on (small images need a finer step).
+    let pixels = w as f64 * h as f64;
+    let settle_step = (1..=4).rev().find(|s| pixels / (s * s) as f64 >= app::MIN_DECISION_SAMPLES as f64).unwrap_or(1);
     for _ in 0..8 {
-        let (_, stats) = renderer.capture(&explorer.frame_params(), 4)?;
+        let (_, stats) = renderer.capture(&explorer.frame_params(), settle_step)?;
         if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
             eprintln!("settle: limit {} -> {stats:?}", explorer.iter_limit);
         }

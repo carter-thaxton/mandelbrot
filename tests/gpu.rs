@@ -5,7 +5,8 @@
 //! Also holds an ignored measurement, `simulated_deep_zoom`:
 //! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
 
-use mandelbrot::app::Explorer;
+use mandelbrot::app::{Explorer, Place};
+use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Output, Renderer, TileBatch};
 
@@ -112,6 +113,54 @@ fn stats_only_draw_leaves_canvas_untouched() {
 
     r.draw(&p, &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
     assert!(r.snapshot().unwrap() != before, "palette change should be visible");
+}
+
+/// Fraction of pure black (never-escaped) pixels, and number of distinct colors.
+fn black_and_colors(rgba: &[u8]) -> (f64, usize) {
+    let px: Vec<&[u8]> = rgba.chunks(4).collect();
+    let black = px.iter().filter(|p| p[..3] == [0, 0, 0]).count() as f64 / px.len() as f64;
+    let colors = px.iter().map(|p| [p[0], p[1], p[2]]).collect::<std::collections::HashSet<_>>().len();
+    (black, colors)
+}
+
+/// Every preset bookmark must show real structure: not one flat color (all
+/// pixels escaping alike) and not mostly black (pixels wrongly never
+/// escaping, as a bug near nuclei once caused).
+#[test]
+fn presets_render_structure() {
+    let mut r = render::create_headless().expect("Metal device");
+    for p in &PRESETS {
+        let mut e = Explorer::new(240, 160);
+        e.go_to(&Place::parse(p.x, p.y, p.span).unwrap());
+        e.set_iter_limit(20_000);
+        let (px, _) = r.capture(&e.frame_params(), 1).unwrap();
+        let (black, colors) = black_and_colors(&px);
+        assert!(colors > 50, "{}: only {colors} colors", p.name);
+        assert!(black < 0.5, "{}: {:.0}% black", p.name, black * 100.0);
+    }
+}
+
+/// Next to a nucleus the reference orbit passes through ~0 every period,
+/// where a fast-phase step is just dz² + dc and can underflow f32. Skipping
+/// iterations by series approximation and iterating them all must agree.
+#[test]
+fn series_skip_and_full_iteration_agree_near_a_nucleus() {
+    let star = PRESETS.iter().find(|p| p.name == "six-armed star").unwrap();
+    let mut r = render::create_headless().expect("Metal device");
+    for span in [1e-63, 1e-75] {
+        let mut images = vec![];
+        for skip in [true, false] {
+            let mut e = Explorer::new(240, 160);
+            e.go_to(&Place::parse(star.x, star.y, span).unwrap());
+            e.set_iter_limit(3000);
+            e.series_skip = skip;
+            images.push(r.capture(&e.frame_params(), 1).unwrap().0);
+        }
+        let (black, _) = black_and_colors(&images[1]);
+        assert!(black < 0.5, "span {span:e}: {:.0}% black without the skip", black * 100.0);
+        let d = differing(&images[0], &images[1]);
+        assert!(d < 0.01, "span {span:e}: {:.2}% of pixels differ", d * 100.0);
+    }
 }
 
 /// Simulated continuous pinch-zoom through the seahorse valley, printing the
