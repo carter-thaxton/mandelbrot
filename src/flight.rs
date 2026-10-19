@@ -12,10 +12,15 @@
 //! w(s) = w0 · cosh(r0) / cosh(r0 + ρs)          so u is accurate near 0)
 //! ```
 //!
-//! ρ ≈ √2 trades zooming against panning. Far-apart places get a zoom-out
-//! to roughly both in view; close ones mostly pan; same-center ones only zoom.
+//! ρ trades zooming against panning: the larger it is, the higher the path
+//! climbs. Between two equally deep places a distance D apart, the widest
+//! view is ρ²/2 · D tall. Close places mostly pan; same-center ones only zoom.
+//!
 //! Moving at constant speed in `s` looks like constant speed to the eye, so
-//! speed is given in zoom decades per second.
+//! cruising speed is given in zoom decades per second. On top of that, speed
+//! follows "gravity": like a ball thrown upward, the flight slows as it
+//! climbs, hangs briefly at its widest view, and speeds up again as it
+//! descends (see [`APEX_SPEED_FRACTION`]).
 //!
 //! Precision: at deep zoom the view is far smaller than anything f64 can
 //! resolve next to the distance between the places. So each frame is placed
@@ -25,13 +30,27 @@
 //! are computed in log space, so `cosh` of the large arguments that deep zooms
 //! produce (hundreds) never overflows.
 
-use std::f64::consts::{LN_2, LN_10, SQRT_2};
+use std::f64::consts::{LN_2, LN_10};
 
 use crate::app::Place;
 use crate::bigfixed::Fixed;
 
-/// Zoom/pan trade-off; the paper's recommended value.
-const RHO: f64 = SQRT_2;
+// Tuning. These set the feel of a flight.
+
+/// Zoom/pan trade-off: the widest view between two equally deep places is
+/// ρ²/2 times their distance (√2, the paper's value, gives just 1x).
+const RHO: f64 = 2.0;
+/// Speed at the flight's widest view, as a fraction of cruising speed.
+pub const APEX_SPEED_FRACTION: f64 = 0.25;
+/// Zoom decades below the widest view at which cruising speed is regained
+/// (speed² grows linearly with depth, as a falling body's does with height).
+pub const APEX_EASE_DECADES: f64 = 1.5;
+
+/// Initial cruising speed, zoom decades per second.
+pub const DEFAULT_SPEED: f64 = 1.5;
+
+// Mechanics.
+
 /// Seconds to reach cruising speed, and roughly to stop from it.
 const RAMP_SECONDS: f64 = 0.5;
 /// Never advance more than this per frame (after a stall, catch up gently).
@@ -41,8 +60,6 @@ const MAX_STEP_SECONDS: f64 = 0.1;
 const MIN_SPEED_FRACTION: f64 = 0.05;
 /// Places closer than this (relative to their view size) are a pure zoom.
 const SAME_CENTER: f64 = 1e-9;
-
-pub const DEFAULT_SPEED: f64 = 1.5;
 
 /// ln(cosh(x)) without overflow.
 fn ln_cosh(x: f64) -> f64 {
@@ -93,6 +110,9 @@ pub struct Flight {
     length: f64,
     travelled: f64,
     elapsed: f64,
+    /// ln of the widest view along the path, and of the current view.
+    ln_w_apex: f64,
+    ln_w: f64,
     /// Cruising speed in zoom decades per second; may change mid-flight.
     pub speed: f64,
 }
@@ -120,12 +140,30 @@ impl Flight {
             let from_end = Half { ln_w0: w1.ln(), r0: -r1 };
             (Shape::Pan { from_start, from_end }, (r1 - r0) / RHO)
         };
+        // The widest view: where r0 + ρs = 0 if that's on the path (w is then
+        // w0·cosh(r0)); otherwise the path only zooms one way, and it's the
+        // shallower end.
+        let (ln_w0, ln_w1) = (w0.ln(), w1.ln());
+        let ln_w_apex = match shape {
+            Shape::Pan { from_start, .. } if (0.0..length).contains(&(-from_start.r0 / RHO)) => {
+                ln_w0 + ln_cosh(from_start.r0)
+            }
+            _ => ln_w0.max(ln_w1),
+        };
         let dir = if distance > 0.0 { (dx / distance, dy / distance) } else { (0.0, 0.0) };
-        Self { from, to, dir, distance, shape, length, travelled: 0.0, elapsed: 0.0, speed }
-    }
-
-    pub fn destination(&self) -> &Place {
-        &self.to
+        Self {
+            from,
+            to,
+            dir,
+            distance,
+            shape,
+            length,
+            travelled: 0.0,
+            elapsed: 0.0,
+            ln_w_apex,
+            ln_w: ln_w0,
+            speed,
+        }
     }
 
     /// Path length per second at cruising speed: one zoom decade is
@@ -139,27 +177,40 @@ impl Flight {
         self.length / self.cruise()
     }
 
-    /// Advance by `dt` seconds of wall-clock time; returns the place to show
-    /// and whether the flight has arrived.
-    pub fn advance(&mut self, dt: f64) -> (Place, bool) {
-        let dt = dt.clamp(0.0, MAX_STEP_SECONDS);
-        self.elapsed += dt;
+    /// Path speed right now: cruising, limited by the start and arrival
+    /// ramps and by gravity near the widest view.
+    fn current_speed(&self) -> f64 {
         let cruise = self.cruise();
         // Speed up over RAMP_SECONDS; slow down so a constant deceleration
         // (cruise / RAMP_SECONDS) would stop exactly at the destination.
         let ramp_up = cruise * (self.elapsed / RAMP_SECONDS);
         let ramp_down = (2.0 * cruise / RAMP_SECONDS * (self.length - self.travelled)).max(0.0).sqrt();
-        let speed = ramp_up.min(ramp_down).min(cruise).max(cruise * MIN_SPEED_FRACTION);
-        self.travelled += speed * dt;
-        if self.travelled >= self.length {
-            self.travelled = self.length;
-            return (self.to.clone(), true);
-        }
-        (self.at(self.travelled), false)
+        // Gravity: speed² = top² + 2·g·depth, reaching cruise at APEX_EASE_DECADES.
+        let top = cruise * APEX_SPEED_FRACTION;
+        let g = (cruise * cruise - top * top) / (2.0 * APEX_EASE_DECADES);
+        let depth = ((self.ln_w_apex - self.ln_w) / LN_10).max(0.0);
+        let gravity = (top * top + 2.0 * g * depth).sqrt();
+        ramp_up.min(ramp_down).min(gravity).min(cruise).max(cruise * MIN_SPEED_FRACTION)
     }
 
-    /// The place at path length `s` (0 < s < length).
-    fn at(&self, s: f64) -> Place {
+    /// Advance by `dt` seconds of wall-clock time; returns the place to show
+    /// and whether the flight has arrived.
+    pub fn advance(&mut self, dt: f64) -> (Place, bool) {
+        let dt = dt.clamp(0.0, MAX_STEP_SECONDS);
+        self.elapsed += dt;
+        self.travelled += self.current_speed() * dt;
+        if self.travelled >= self.length {
+            self.travelled = self.length;
+            self.ln_w = self.to.span.ln();
+            return (self.to.clone(), true);
+        }
+        let (place, ln_w) = self.at(self.travelled);
+        self.ln_w = ln_w;
+        (place, false)
+    }
+
+    /// The place at path length `s` (0 < s < length), and its ln view size.
+    fn at(&self, s: f64) -> (Place, f64) {
         let (offset_from_start, offset_from_end, ln_w) = match self.shape {
             Shape::Pan { from_start, from_end } => {
                 let (u_start, ln_w_start) = from_start.at(s);
@@ -185,7 +236,7 @@ impl Flight {
             (_, Some(u)) => offset(&self.to.center, self.dir, -u),
             _ => unreachable!(),
         };
-        Place { center, span: ln_w.exp() }
+        (Place { center, span: ln_w.exp() }, ln_w)
     }
 }
 
@@ -284,6 +335,74 @@ mod tests {
         }
     }
 
+    /// Two equally deep places 1.3 apart (seahorse valley and c = i).
+    fn far_apart() -> (Place, Place) {
+        (
+            place("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139", 1e-40),
+            place("0", "1", 1e-40),
+        )
+    }
+
+    /// Per frame: (seconds, decades below the widest view, speed / cruise),
+    /// with the depth that set that frame's speed (where it started).
+    fn profile(from: &Place, to: &Place, speed: f64) -> Vec<(f64, f64, f64)> {
+        let mut f = Flight::new(from.clone(), to.clone(), speed);
+        let (mut rows, mut t) = (vec![], 0.0);
+        loop {
+            let (before, depth) = (f.travelled, (f.ln_w_apex - f.ln_w) / LN_10);
+            let (_, done) = f.advance(1.0 / 60.0);
+            t += 1.0 / 60.0;
+            rows.push((t, depth, (f.travelled - before) * 60.0 / f.cruise()));
+            if done {
+                return rows;
+            }
+        }
+    }
+
+    #[test]
+    fn apex_is_rho_squared_over_two_times_the_distance() {
+        let (a, b) = far_apart();
+        let f = Flight::new(a.clone(), b.clone(), 1.0);
+        let expected = RHO * RHO / 2.0 * f.distance;
+        let apex = f.ln_w_apex.exp();
+        assert!((apex / expected - 1.0).abs() < 1e-6, "apex {apex} vs {expected}");
+        // And the flight actually gets there (it lingers, so frames sample it).
+        let widest = fly(&a, &b, 4.0).iter().map(|p| p.span).fold(0.0, f64::max);
+        assert!(widest / apex > 0.99, "widest frame {widest} vs apex {apex}");
+    }
+
+    #[test]
+    fn slows_at_the_apex_and_cruises_below_it() {
+        let (a, b) = far_apart();
+        let rows = profile(&a, &b, 4.0);
+        // At the widest view: about the apex fraction of cruising speed.
+        let top = rows.iter().min_by(|x, y| x.1.total_cmp(&y.1)).unwrap();
+        assert!(top.1 < 0.05, "never reached the apex: {top:?}");
+        assert!(top.2 < APEX_SPEED_FRACTION + 0.05, "apex speed {:.2} of cruise", top.2);
+        // Well below it (and clear of the start and arrival ramps): cruising.
+        let end = rows.last().unwrap().0;
+        let deep: Vec<_> = rows.iter().filter(|r| r.1 >= APEX_EASE_DECADES && r.0 > 1.0 && r.0 < end - 1.0).collect();
+        assert!(!deep.is_empty() && deep.iter().all(|r| (r.2 - 1.0).abs() < 1e-9), "not cruising below the apex");
+        // In between, speed rises with depth.
+        let mut easing: Vec<_> = rows.iter().filter(|r| r.1 > 0.1 && r.1 < APEX_EASE_DECADES && r.0 > 1.0 && r.0 < end - 1.0).collect();
+        easing.sort_by(|x, y| x.1.total_cmp(&y.1));
+        assert!(easing.windows(2).all(|w| w[1].2 >= w[0].2 - 1e-9), "speed not increasing with depth");
+    }
+
+    /// Prints a flight's profile, for tuning by eye:
+    /// `cargo test --release --lib print_flight_profile -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn print_flight_profile() {
+        let (a, b) = far_apart();
+        println!("{:>6} {:>18} {:>14}", "secs", "decades below top", "speed/cruise");
+        for (i, (t, depth, v)) in profile(&a, &b, DEFAULT_SPEED).into_iter().enumerate() {
+            if i % 15 == 0 {
+                println!("{t:>6.2} {depth:>18.2} {v:>14.2}");
+            }
+        }
+    }
+
     #[test]
     fn same_center_only_zooms() {
         let from = place("0", "1", 1e-5);
@@ -292,7 +411,7 @@ mod tests {
         // 40 decades at 4 decades/s.
         assert!((f.cruise_seconds() - 10.0).abs() < 1e-9, "{}", f.cruise_seconds());
         while !f.advance(1.0 / 60.0).1 {
-            let (p, _) = (f.at(f.travelled), ());
+            let (p, _) = f.at(f.travelled);
             assert_eq!(apart(&p, &from), 0.0);
         }
     }
