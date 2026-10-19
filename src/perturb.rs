@@ -128,8 +128,13 @@ const BAILOUT2: f64 = 65536.0;
 pub fn compute_reference(cx: &Fixed, cy: &Fixed, max_iter: u32) -> ReferenceOrbit {
     let start = std::time::Instant::now();
     let frac = cx.frac_limbs().max(cy.frac_limbs());
+    // Equal precision everywhere, so the in-place ops below never realign.
+    let (cx, cy) = (cx.with_frac_limbs(frac), cy.with_frac_limbs(frac));
     let mut x = Fixed::zero(frac);
     let mut y = Fixed::zero(frac);
+    // Reused every iteration: the loop allocates nothing for Fixed math.
+    let (mut x2, mut y2, mut xy) = (Fixed::zero(frac), Fixed::zero(frac), Fixed::zero(frac));
+    let mut scratch = Vec::new();
     let mut points = Vec::with_capacity(max_iter as usize + 1);
     points.push(ref_point(0.0, 0.0));
     let mut series = Vec::with_capacity(max_iter as usize + 1);
@@ -139,11 +144,17 @@ pub fn compute_reference(cx: &Fixed, cy: &Fixed, max_iter: u32) -> ReferenceOrbi
     let mut escaped = false;
 
     for _ in 0..max_iter {
-        let x2 = &x * &x;
-        let y2 = &y * &y;
-        let xy = &x * &y;
-        y = &(&xy + &xy) + cy;
-        x = &(&x2 - &y2) + cx;
+        x.mul_into(&x, &mut x2, &mut scratch);
+        y.mul_into(&y, &mut y2, &mut scratch);
+        x.mul_into(&y, &mut xy, &mut scratch);
+        // y = 2xy + cy
+        y.clone_from(&xy);
+        y += &xy;
+        y += &cy;
+        // x = x^2 - y^2 + cx
+        x.clone_from(&x2);
+        x -= &y2;
+        x += &cx;
 
         // A_{n+1} = 2 Z_n A_n + 1,  B_{n+1} = 2 Z_n B_n + A_n^2
         let two_z = Fe::new(2.0 * zx, 2.0 * zy, 0);
