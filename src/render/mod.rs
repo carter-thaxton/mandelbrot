@@ -5,10 +5,11 @@
 //! would implement the same trait and reuse [`GpuParams`] as its uniform.
 //!
 //! Renderers own a persistent *canvas* the size of the window, divided into
-//! [`TILE`]-pixel square tiles. The app fills it progressively, tile batches
-//! at a time, and every `draw` call presents the canvas so partial progress
-//! is visible. When the view moves, `reproject` resamples the existing canvas
-//! into the new view so previous work is reused.
+//! [`TILE`]-pixel square tiles. The app fills it progressively with `draw`,
+//! tile batches at a time, and calls `present` to show the canvas whenever it
+//! changed, so partial progress is visible. When the view moves, `reproject`
+//! resamples the existing canvas into the new view so previous work is
+//! reused.
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
@@ -23,7 +24,16 @@ pub type Result<T> = std::result::Result<T, String>;
 /// Canvas tile edge in pixels. Must match TILE in the shader.
 pub const TILE: u32 = 16;
 
-/// Which tiles of the canvas to compute, and how coarsely.
+/// What a kernel dispatch produces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// Write pixels to the target (and gather statistics).
+    Pixels,
+    /// Gather statistics only; leave the target untouched.
+    StatsOnly,
+}
+
+/// Which tiles of the canvas to compute, how coarsely, and what to produce.
 #[derive(Clone, Debug)]
 pub struct TileBatch {
     /// Top-left pixel of each tile (multiples of [`TILE`]).
@@ -31,17 +41,20 @@ pub struct TileBatch {
     /// Sample every `step` pixels and fill step x step blocks (1 = full res).
     /// A power of two no larger than [`TILE`].
     pub step: u32,
-    /// Only gather statistics; leave the canvas untouched.
-    pub stats_only: bool,
+    pub output: Output,
 }
 
 impl TileBatch {
+    pub fn new(tiles: Vec<[u32; 2]>, step: u32, output: Output) -> Self {
+        Self { tiles, step, output }
+    }
+
     /// Every tile of a `width` x `height` canvas.
-    pub fn all(width: u32, height: u32, step: u32) -> Self {
+    pub fn all(width: u32, height: u32, step: u32, output: Output) -> Self {
         let tiles = (0..height.div_ceil(TILE))
             .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| [tx * TILE, ty * TILE]))
             .collect();
-        Self { tiles, step, stats_only: false }
+        Self::new(tiles, step, output)
     }
 }
 
@@ -88,8 +101,15 @@ pub trait Renderer {
     /// Canvas contents are undefined afterwards.
     fn resize(&mut self, width: u32, height: u32, scale_factor: f64);
 
-    /// Compute `batch` of the canvas, then present the canvas to the window.
+    /// Compute `batch` of the canvas (or only its statistics; see [`Output`]).
+    /// Nothing appears on screen until [`Renderer::present`].
     fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats>;
+
+    /// Show the current canvas in the window (a no-op without one).
+    fn present(&mut self) -> Result<()>;
+
+    /// Read back the current canvas as RGBA8 rows (what `present` shows).
+    fn snapshot(&mut self) -> Result<Vec<u8>>;
 
     /// Resample the canvas contents for a new view (see [`Reprojection`]).
     /// Pixels with no source become black.
@@ -154,7 +174,7 @@ pub struct GpuParams {
     pub sa_n: u32,
     pub sa_a_m: [f32; 2],
     pub sa_a_e: i32,
-    /// Nonzero: compute statistics only, write no pixels.
+    /// Nonzero: compute statistics only, write no pixels ([`Output`]).
     pub stats_only: u32,
 }
 
@@ -165,7 +185,7 @@ fn split_f64(v: f64) -> [f32; 2] {
 }
 
 impl GpuParams {
-    pub fn new(p: &FrameParams, step: u32) -> Self {
+    pub fn new(p: &FrameParams, step: u32, output: Output) -> Self {
         let (scale_m, scale_e) = frexp(p.scale);
         let (ref_off_m, ref_off_e) = complex_floatexp(p.ref_offset.0, p.ref_offset.1);
         Self {
@@ -192,7 +212,7 @@ impl GpuParams {
             sa_n: p.series_n,
             sa_a_m: p.series_a.0,
             sa_a_e: p.series_a.1,
-            stats_only: 0,
+            stats_only: (output == Output::StatsOnly) as u32,
         }
     }
 }

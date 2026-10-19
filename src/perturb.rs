@@ -3,11 +3,15 @@
 //! Instead of iterating every pixel at high precision, we iterate ONE point,
 //! the reference C (the view center), at high precision:
 //!
-//!     Z_{n+1} = Z_n^2 + C
+//! ```text
+//! Z_{n+1} = Z_n^2 + C
+//! ```
 //!
 //! Each pixel c = C + dc then only tracks its small difference dz = z - Z:
 //!
-//!     dz_{n+1} = 2 Z_n dz_n + dz_n^2 + dc  =  (2 Z_n + dz_n) dz_n + dc
+//! ```text
+//! dz_{n+1} = 2 Z_n dz_n + dz_n^2 + dc  =  (2 Z_n + dz_n) dz_n + dc
+//! ```
 //!
 //! dz and dc are tiny, but *relatively* they only need ~7 digits, so f32 on the
 //! GPU is enough. The reference only needs to be stored rounded to f32, since

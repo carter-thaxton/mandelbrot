@@ -32,7 +32,7 @@
 
 use crate::app::{Explorer, FrameParams, MIN_DECISION_SAMPLES, Precision};
 use crate::bigfixed::Fixed;
-use crate::render::{FrameStats, Renderer, Reprojection, Result, TILE, TileBatch};
+use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
 
 /// GPU time to aim for per frame (ms). Leaves headroom inside a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 12.0;
@@ -66,12 +66,25 @@ impl Look {
     }
 }
 
-/// What the canvas currently shows, tile by tile.
-struct Canvas {
+/// The geometry of a view: which point of the plane each pixel shows.
+#[derive(Clone, PartialEq)]
+struct View {
     center: (Fixed, Fixed),
+    /// Complex-plane units per pixel.
     scale: f64,
     width: u32,
     height: u32,
+}
+
+impl View {
+    fn of(e: &Explorer) -> Self {
+        Self { center: e.center.clone(), scale: e.scale, width: e.width, height: e.height }
+    }
+}
+
+/// What the canvas currently shows, tile by tile.
+struct Canvas {
+    view: View,
     look: Look,
     cols: u32,
     rows: u32,
@@ -79,13 +92,10 @@ struct Canvas {
 }
 
 impl Canvas {
-    fn new(e: &Explorer, look: Look) -> Self {
-        let (cols, rows) = (e.width.div_ceil(TILE), e.height.div_ceil(TILE));
+    fn new(view: View, look: Look) -> Self {
+        let (cols, rows) = (view.width.div_ceil(TILE), view.height.div_ceil(TILE));
         Self {
-            center: e.center.clone(),
-            scale: e.scale,
-            width: e.width,
-            height: e.height,
+            view,
             look,
             cols,
             rows,
@@ -100,8 +110,8 @@ impl Canvas {
     /// Squared distance from a tile's center to the canvas center (pixels).
     fn dist2(&self, i: usize) -> f64 {
         let [x, y] = self.origin(i);
-        let dx = (x + TILE / 2) as f64 - self.width as f64 / 2.0;
-        let dy = (y + TILE / 2) as f64 - self.height as f64 / 2.0;
+        let dx = (x + TILE / 2) as f64 - self.view.width as f64 / 2.0;
+        let dy = (y + TILE / 2) as f64 - self.view.height as f64 / 2.0;
         dx * dx + dy * dy
     }
 
@@ -111,11 +121,12 @@ impl Canvas {
 }
 
 /// How to map the old canvas into a new view, plus the tile bookkeeping.
-fn reprojected(old: &Canvas, e: &Explorer, look: Look) -> (Canvas, Reprojection) {
-    let ratio = e.scale / old.scale; // new pixel size in old pixels
+fn reprojected(old: &Canvas, view: View, look: Look) -> (Canvas, Reprojection) {
+    let o = &old.view;
+    let ratio = view.scale / o.scale; // new pixel size in old pixels
     let mut shift = (
-        (&e.center.0 - &old.center.0).to_f64() / old.scale,
-        -(&e.center.1 - &old.center.1).to_f64() / old.scale,
+        (&view.center.0 - &o.center.0).to_f64() / o.scale,
+        -(&view.center.1 - &o.center.1).to_f64() / o.scale,
     );
     // A same-scale move by (almost exactly) whole pixels copies old pixels
     // unchanged, so they remain exact.
@@ -125,23 +136,24 @@ fn reprojected(old: &Canvas, e: &Explorer, look: Look) -> (Canvas, Reprojection)
         shift = (shift.0.round(), shift.1.round());
     }
 
-    let mut new = Canvas::new(e, look);
+    let mut new = Canvas::new(view, look);
+    let n = &new.view;
     // Old-canvas position (pixels) of new-canvas position (x, y).
     let to_old = |x: f64, y: f64| {
         (
-            old.width as f64 / 2.0 + (x - new.width as f64 / 2.0) * ratio + shift.0,
-            old.height as f64 / 2.0 + (y - new.height as f64 / 2.0) * ratio + shift.1,
+            o.width as f64 / 2.0 + (x - n.width as f64 / 2.0) * ratio + shift.0,
+            o.height as f64 / 2.0 + (y - n.height as f64 / 2.0) * ratio + shift.1,
         )
     };
     let eps = 1e-6;
     let mut tiles = vec![MISSING; new.tiles.len()];
     for (i, tile) in tiles.iter_mut().enumerate() {
         let [x0, y0] = new.origin(i);
-        let x1 = (x0 + TILE).min(new.width);
-        let y1 = (y0 + TILE).min(new.height);
+        let x1 = (x0 + TILE).min(n.width);
+        let y1 = (y0 + TILE).min(n.height);
         let (u0, v0) = to_old(x0 as f64, y0 as f64);
         let (u1, v1) = to_old(x1 as f64, y1 as f64);
-        if u0 < -eps || v0 < -eps || u1 > old.width as f64 + eps || v1 > old.height as f64 + eps {
+        if u0 < -eps || v0 < -eps || u1 > o.width as f64 + eps || v1 > o.height as f64 + eps {
             continue; // part of this tile has no source: compute it fresh
         }
         // Old tiles this one draws from (bilinear can touch one texel beyond).
@@ -161,7 +173,7 @@ fn reprojected(old: &Canvas, e: &Explorer, look: Look) -> (Canvas, Reprojection)
         *tile = Tile { res: (res as f64 / ratio) as f32, exact };
     }
     new.tiles = tiles;
-    let xf = Reprojection { ratio, shift, old_size: (old.width, old.height) };
+    let xf = Reprojection { ratio, shift, old_size: (o.width, o.height) };
     (new, xf)
 }
 
@@ -204,11 +216,17 @@ pub struct Scheduler {
     /// Probe statistics accumulated until there are enough to decide on
     /// (coarse probes of expensive views have only a few thousand samples).
     probe_stats: FrameStats,
-    /// Override for PROBE_INTERVAL (tests).
+    /// Override for PROBE_INTERVAL.
     probe_interval: Option<std::time::Duration>,
 }
 
 impl Scheduler {
+    /// A scheduler that probes statistics at most every `interval` while the
+    /// view changes (default PROBE_INTERVAL). Zero probes on every change.
+    pub fn with_probe_interval(interval: std::time::Duration) -> Self {
+        Self { probe_interval: Some(interval), ..Default::default() }
+    }
+
     /// The renderer's canvas was recreated (e.g. window resize): forget it.
     pub fn reset(&mut self) {
         self.canvas = None;
@@ -254,25 +272,25 @@ impl Scheduler {
         s.next_power_of_two().min(TILE)
     }
 
-    /// Bring the canvas bookkeeping up to date with the explorer's view,
+    /// Bring the canvas bookkeeping up to date with the current view,
     /// reprojecting the old image if that's worthwhile.
-    fn sync(&mut self, e: &Explorer, p: &FrameParams, renderer: &mut dyn Renderer) -> Result<bool> {
+    fn sync(&mut self, view: View, p: &FrameParams, renderer: &mut dyn Renderer) -> Result<bool> {
         let look = Look::of(p);
         let Some(old) = self.canvas.take() else {
             self.sweep = None;
-            self.canvas = Some(Canvas::new(e, look));
+            self.canvas = Some(Canvas::new(view, look));
             self.work_ms = 0.0;
             return Ok(true);
         };
-        if old.width != e.width || old.height != e.height {
+        if old.view.width != view.width || old.view.height != view.height {
             self.sweep = None;
-            self.canvas = Some(Canvas::new(e, look));
+            self.canvas = Some(Canvas::new(view, look));
             self.work_ms = 0.0;
             return Ok(true);
         }
-        let moved = old.scale != e.scale || old.center != e.center;
+        let moved = old.view != view;
         let mut canvas = if moved {
-            let (new, xf) = reprojected(&old, e, look.clone());
+            let (new, xf) = reprojected(&old, view, look.clone());
             if new.tiles.iter().any(|t| t.res.is_finite()) {
                 renderer.reproject(&xf)?;
             }
@@ -346,17 +364,21 @@ impl Scheduler {
     /// caller should request another redraw).
     pub fn step(&mut self, explorer: &mut Explorer, renderer: &mut dyn Renderer) -> Result<bool> {
         let params = explorer.frame_params();
-        let moved = self.sync(explorer, &params, renderer)?;
+        let moved = self.sync(View::of(explorer), &params, renderer)?;
 
         if self.probe_due
             && explorer.auto_iter
             && self.last_probe.is_none_or(|t| t.elapsed() >= self.probe_interval.unwrap_or(PROBE_INTERVAL))
         {
-            // Spend this frame on whole-view statistics (it still presents
-            // the canvas, including any reprojection just done).
+            // Spend this frame on whole-view statistics. The canvas only
+            // changed if it was just reprojected.
+            if moved {
+                renderer.present()?;
+            }
             let canvas = self.canvas.as_ref().unwrap();
-            let all = TileBatch::all(canvas.width, canvas.height, self.preview_step(&params).max(PROBE_MIN_STEP));
-            let stats = renderer.draw(&params, &TileBatch { stats_only: true, ..all })?;
+            let step = self.preview_step(&params).max(PROBE_MIN_STEP);
+            let probe = TileBatch::all(canvas.view.width, canvas.view.height, step, Output::StatsOnly);
+            let stats = renderer.draw(&params, &probe)?;
             self.record(&stats);
             self.probe_stats.merge(&stats);
             if self.probe_stats.samples >= MIN_DECISION_SAMPLES {
@@ -379,16 +401,16 @@ impl Scheduler {
 
         let Some((tiles, step)) = self.pick(&params) else {
             if moved {
-                // Reprojection alone: still needs presenting.
-                renderer.draw(&params, &TileBatch { tiles: vec![], step: 1, stats_only: false })?;
+                renderer.present()?; // a reprojection with nothing left to compute
             }
             return Ok(false);
         };
         let canvas = self.canvas.as_ref().unwrap();
-        let batch = TileBatch { tiles: tiles.iter().map(|&i| canvas.origin(i)).collect(), step, stats_only: false };
+        let batch = TileBatch::new(tiles.iter().map(|&i| canvas.origin(i)).collect(), step, Output::Pixels);
         let total = canvas.tiles.len();
 
         let stats = renderer.draw(&params, &batch)?;
+        renderer.present()?;
         self.record(&stats);
         let canvas = self.canvas.as_mut().unwrap();
         for &i in &tiles {
@@ -423,182 +445,91 @@ impl Scheduler {
 mod tests {
     use super::*;
 
-    /// Records batches instead of drawing; reports a fixed cost per sample.
-    #[derive(Default)]
-    struct Mock {
-        batches: Vec<TileBatch>,
-        reprojections: Vec<Reprojection>,
+    fn view(width: u32, height: u32, cx: f64, scale: f64) -> View {
+        View { center: (Fixed::from_f64(cx, 2), Fixed::zero(2)), scale, width, height }
     }
 
-    impl Renderer for Mock {
-        fn resize(&mut self, _: u32, _: u32, _: f64) {}
-        fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
-            self.batches.push(batch.clone());
-            let per = (TILE / batch.step).pow(2) as u64;
-            let samples = batch.tiles.len() as u64 * per;
-            // A settled iteration limit: nothing near it, nothing far below.
-            let max_escaped = p.max_iter / 2 - 1;
-            Ok(FrameStats { gpu_ms: samples as f64 * 1e-4, samples, max_escaped, near_limit: 0, interior: 0 })
-        }
-        fn reproject(&mut self, xf: &Reprojection) -> Result<()> {
-            self.reprojections.push(*xf);
-            Ok(())
-        }
-        fn capture(&mut self, _: &FrameParams, _: u32) -> Result<(Vec<u8>, FrameStats)> {
-            unimplemented!()
-        }
+    fn look() -> Look {
+        Look { palette: 0, color_density: 1.0, precision: Precision::F32, max_iter: 1000 }
     }
 
-    fn run_to_completion(s: &mut Scheduler, e: &mut Explorer, m: &mut Mock) -> usize {
-        let mut frames = 0;
-        while s.step(e, m).unwrap() {
-            frames += 1;
-            assert!(frames < 10_000, "never finished");
-        }
-        frames
-    }
-
-    /// Full-resolution tiles computed since `from`.
-    fn exact_tiles(m: &Mock, from: usize) -> usize {
-        m.batches[from..].iter().filter(|b| b.step == 1 && !b.stats_only).map(|b| b.tiles.len()).sum()
+    /// A canvas whose every tile was computed exactly.
+    fn finished(view: View) -> Canvas {
+        let mut c = Canvas::new(view, look());
+        c.tiles.fill(Tile { res: 1.0, exact: true });
+        c
     }
 
     #[test]
-    fn fresh_view_previews_then_refines_every_tile_once() {
-        let mut e = Explorer::new(400, 300);
-        let (mut s, mut m) = (Scheduler::default(), Mock::default());
-        run_to_completion(&mut s, &mut e, &mut m);
-        assert!(m.batches.iter().find(|b| !b.stats_only).unwrap().step > 1, "first work should be a coarse preview");
-        let mut seen = std::collections::HashMap::new();
-        for b in m.batches.iter().filter(|b| b.step == 1 && !b.stats_only) {
-            for t in &b.tiles {
-                *seen.entry(*t).or_insert(0) += 1;
-            }
-        }
-        let total = (400u32.div_ceil(TILE) * 300u32.div_ceil(TILE)) as usize;
-        assert_eq!(seen.len(), total);
-        assert!(seen.values().all(|&n| n == 1));
-        assert_eq!(s.progress(), None);
+    fn whole_pixel_pan_keeps_overlap_exact() {
+        // 25 x 19 tiles; move the view 40 px right: content shifts left.
+        let old = finished(view(400, 304, 0.0, 0.01));
+        let (new, xf) = reprojected(&old, view(400, 304, 0.40, 0.01), look());
+        assert_eq!(xf.ratio, 1.0);
+        assert_eq!(xf.shift, (40.0, 0.0));
+        let stale: Vec<usize> = (0..new.tiles.len()).filter(|&i| !new.tiles[i].exact).collect();
+        // 40 revealed columns touch the last 3 tile columns, plus one column
+        // whose source straddles the old edge: at most 4 of 25 columns.
+        assert!(stale.len() <= 4 * 19 && stale.len() >= 3 * 19, "{} stale", stale.len());
+        assert!(stale.iter().all(|&i| new.origin(i)[0] >= 400 - 4 * TILE));
+        assert!(new.tiles.iter().filter(|t| t.exact).all(|t| t.res == 1.0));
     }
 
     #[test]
-    fn whole_pixel_pan_only_computes_revealed_tiles() {
-        let mut e = Explorer::new(400, 304); // 25 x 19 tiles
-        let (mut s, mut m) = (Scheduler::default(), Mock::default());
-        run_to_completion(&mut s, &mut e, &mut m);
-
-        let before = m.batches.len();
-        e.pan_pixels(-40.0, 0.0); // content moves left: 40 new columns on the right
-        run_to_completion(&mut s, &mut e, &mut m);
-        let xf = m.reprojections.last().unwrap();
-        assert_eq!((xf.ratio, xf.shift), (1.0, (40.0, 0.0)));
-        // Exact tiles survive where their whole source was exact; the 40 new
-        // columns touch 3 tile columns, plus one more misaligned column.
-        let redone = exact_tiles(&m, before);
-        assert!(redone <= 4 * 19, "recomputed {redone} tiles for a 40 px pan");
-        assert!(redone >= 3 * 19);
-    }
-
-    /// Every batch looks under-iterated (as tiles along the boundary do).
-    struct Pessimist;
-
-    impl Renderer for Pessimist {
-        fn resize(&mut self, _: u32, _: u32, _: f64) {}
-        fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
-            let samples = batch.tiles.len() as u64 * (TILE / batch.step).pow(2) as u64;
-            // Only full-resolution batches near the boundary look cut off.
-            let near_limit = if batch.step == 1 { (samples / 50) as u32 } else { 0 };
-            Ok(FrameStats { gpu_ms: samples as f64 * 1e-3, samples, max_escaped: p.max_iter - 1, near_limit, interior: 0 })
-        }
-        fn reproject(&mut self, _: &Reprojection) -> Result<()> {
-            Ok(())
-        }
-        fn capture(&mut self, _: &FrameParams, _: u32) -> Result<(Vec<u8>, FrameStats)> {
-            unimplemented!()
-        }
+    fn sub_pixel_pan_is_not_exact() {
+        let old = finished(view(400, 304, 0.0, 0.01));
+        let (new, _) = reprojected(&old, view(400, 304, 0.005, 0.01), look());
+        assert!(new.tiles.iter().all(|t| !t.exact));
     }
 
     #[test]
-    fn iteration_limit_is_judged_per_sweep_not_per_batch() {
-        let mut e = Explorer::new(400, 304);
-        let mut s = Scheduler::default();
-        let start = e.iter_limit;
-        let mut batches = 0;
-        while e.iter_limit == start {
-            assert!(s.step(&mut e, &mut Pessimist).unwrap());
-            batches += 1;
-            assert!(batches < 10_000);
-        }
-        // The pessimist's batches all looked cut off, but the limit only grew
-        // once the whole view had been refined.
-        assert!(batches > 5, "expected several batches, got {batches}");
-        assert_eq!(s.progress(), None, "limit changed mid-sweep");
-        assert_eq!(e.iter_limit, start * 2);
-    }
-
-    /// A view that needs `needed` iterations: below that, half the samples
-    /// stay black and most escapes land near the limit.
-    struct Needs {
-        needed: u32,
-    }
-
-    impl Renderer for Needs {
-        fn resize(&mut self, _: u32, _: u32, _: f64) {}
-        fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
-            let samples = batch.tiles.len() as u64 * (TILE / batch.step).pow(2) as u64;
-            let (max_escaped, near_limit, interior) = if p.max_iter < self.needed {
-                (p.max_iter - 1, (samples / 4) as u32, (samples / 2) as u32)
-            } else {
-                (self.needed - 1, 0, 0)
-            };
-            Ok(FrameStats { gpu_ms: samples as f64 * 1e-4, samples, max_escaped, near_limit, interior })
-        }
-        fn reproject(&mut self, _: &Reprojection) -> Result<()> {
-            Ok(())
-        }
-        fn capture(&mut self, _: &FrameParams, _: u32) -> Result<(Vec<u8>, FrameStats)> {
-            unimplemented!()
-        }
-    }
-
-    #[test]
-    fn limit_adapts_during_continuous_motion() {
-        let mut e = Explorer::new(400, 304);
-        let mut s = Scheduler { probe_interval: Some(std::time::Duration::ZERO), ..Default::default() };
-        let mut r = Needs { needed: 8000 };
-        let start = e.iter_limit;
-        // Pan a little every frame: no sweep ever completes.
-        for _ in 0..40 {
-            s.step(&mut e, &mut r).unwrap();
-            e.pan_pixels(3.0, 0.0);
-        }
-        assert!(e.iter_limit >= 8000, "limit stuck at {} (started at {start})", e.iter_limit);
-        assert!(e.iter_limit < 4 * 8000, "overshot to {}", e.iter_limit);
-    }
-
-    #[test]
-    fn zoom_reuses_old_image_as_preview() {
-        let mut e = Explorer::new(400, 304);
-        let (mut s, mut m) = (Scheduler::default(), Mock::default());
-        run_to_completion(&mut s, &mut e, &mut m);
-
-        // Zoom in 1.5x: everything has a (blurry) source, nothing is missing.
-        let look = s.canvas.as_ref().unwrap().look.clone();
-        e.zoom_at_center(1.5);
-        let (c, xf) = reprojected(s.canvas.as_ref().unwrap(), &e, look.clone());
+    fn zoom_in_scales_blur_and_keeps_every_tile() {
+        let old = finished(view(400, 304, 0.0, 0.01));
+        let (new, xf) = reprojected(&old, view(400, 304, 0.0, 0.01 / 1.5), look());
         assert!((xf.ratio - 1.0 / 1.5).abs() < 1e-12);
-        assert!(c.tiles.iter().all(|t| !t.exact && (t.res - 1.5).abs() < 1e-3));
-        // So no coarse pass is needed: straight to full-resolution refinement.
-        let before = m.batches.len();
-        run_to_completion(&mut s, &mut e, &mut m);
-        assert!(m.batches[before..].iter().filter(|b| !b.stats_only).all(|b| b.step == 1));
+        assert!(new.tiles.iter().all(|t| !t.exact && (t.res - 1.5).abs() < 1e-3));
+    }
 
-        // Zoom out 2x: the middle quarter has sharp sources, the border none.
-        e.zoom_at_center(0.5);
-        let (c, _) = reprojected(s.canvas.as_ref().unwrap(), &e, look);
-        assert!(c.tiles.iter().filter(|t| t.res.is_finite()).all(|t| t.res <= 0.5 + 1e-6));
-        let missing = c.tiles.iter().filter(|t| t.res.is_infinite()).count() as f64;
-        let frac = missing / c.tiles.len() as f64;
+    #[test]
+    fn zoom_out_leaves_border_missing() {
+        let old = finished(view(400, 304, 0.0, 0.01));
+        let (new, _) = reprojected(&old, view(400, 304, 0.0, 0.02), look());
+        // The middle quarter comes from denser old samples...
+        assert!(new.tiles.iter().filter(|t| t.res.is_finite()).all(|t| t.res <= 0.5 + 1e-6));
+        // ...and the rest has no source at all.
+        let missing = new.tiles.iter().filter(|t| t.res.is_infinite()).count() as f64;
+        let frac = missing / new.tiles.len() as f64;
         assert!(frac > 0.6 && frac < 0.85, "missing fraction {frac}");
+    }
+
+    #[test]
+    fn reprojection_inherits_worst_source_tile() {
+        let mut old = finished(view(400, 304, 0.0, 0.01));
+        old.tiles[0] = MISSING; // top-left corner never computed
+        let (new, _) = reprojected(&old, view(400, 304, 0.0, 0.01 / 1.5), look());
+        // Zooming in toward the center pulls nothing from the corner...
+        assert!(new.tiles.iter().all(|t| t.res.is_finite()));
+        // ...but a pure pan that brings the corner into the middle does.
+        let (moved, _) = reprojected(&old, view(400, 304, -2.0, 0.01), look());
+        assert!(moved.tiles.iter().any(|t| t.res.is_infinite()));
+    }
+
+    #[test]
+    fn sweep_completes_once_every_tile_is_covered() {
+        let mut sweep = Sweep::new(4);
+        let stats = |max_escaped, near_limit| FrameStats {
+            gpu_ms: 1.0,
+            samples: 100,
+            max_escaped,
+            near_limit,
+            interior: 10,
+        };
+        assert!(!sweep.add(&stats(50, 1), &[0, 1]));
+        assert!(!sweep.add(&stats(70, 2), &[1, 2]), "tile 1 twice must not count double");
+        assert!(sweep.add(&stats(60, 3), &[3]));
+        assert_eq!(sweep.stats.samples, 300);
+        assert_eq!(sweep.stats.max_escaped, 70);
+        assert_eq!(sweep.stats.near_limit, 6);
+        assert_eq!(sweep.stats.interior, 30);
     }
 }

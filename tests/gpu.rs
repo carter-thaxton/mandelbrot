@@ -1,0 +1,145 @@
+//! End-to-end tests on the real GPU renderer (headless): the explorer's
+//! frame parameters, the scheduler's reuse of earlier work, and the kernel
+//! must together produce the same pixels as a fresh render.
+//!
+//! Also holds an ignored measurement, `simulated_deep_zoom`:
+//! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
+
+use mandelbrot::app::Explorer;
+use mandelbrot::progressive::Scheduler;
+use mandelbrot::render::{self, Output, Renderer, TileBatch};
+
+const SEAHORSE: (&str, &str) = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
+
+/// A headless renderer with a `width` x `height` canvas.
+fn renderer(width: u32, height: u32) -> Box<dyn Renderer> {
+    let mut r = render::create_headless().expect("Metal device");
+    r.resize(width, height, 1.0);
+    r
+}
+
+/// Fraction of pixels whose color differs noticeably between two RGBA images.
+fn differing(a: &[u8], b: &[u8]) -> f64 {
+    let bad = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| (0..3).any(|i| x[i].abs_diff(y[i]) > 16)).count();
+    bad as f64 / (a.len() / 4) as f64
+}
+
+fn run_to_completion(s: &mut Scheduler, e: &mut Explorer, r: &mut dyn Renderer) {
+    for _ in 0..100_000 {
+        if !s.step(e, r).unwrap() {
+            return;
+        }
+    }
+    panic!("scheduler never finished");
+}
+
+/// Rendering against a reused, off-center reference (as happens while
+/// panning) must match rendering against a fresh centered one.
+#[test]
+fn off_center_reference_matches_fresh() {
+    let mut r = render::create_headless().expect("Metal device");
+    for zoom in [1e8, 1e40] {
+        // c = i: a boundary point with smooth surroundings at every depth, so
+        // any offset error shows up as a visibly shifted image.
+        let mut panned = Explorer::new(320, 200);
+        panned.set_center_str("0", "1");
+        panned.zoom_at_center(zoom);
+        panned.set_iter_limit(4000);
+        panned.frame_params(); // creates the reference at this center
+        panned.pan_pixels(120.0, -70.0);
+        let reused = panned.frame_params();
+        assert!(reused.ref_offset != (0.0, 0.0), "reference should have been reused");
+
+        let mut fresh = Explorer::new(320, 200);
+        fresh.center = panned.center.clone();
+        fresh.scale = panned.scale;
+        fresh.set_iter_limit(4000);
+        let centered = fresh.frame_params();
+        // Only the truncation of the center to the needed precision.
+        let off = centered.ref_offset.0.abs().max(centered.ref_offset.1.abs());
+        assert!(off < centered.scale * 1e-6, "{off:e}");
+
+        let (a, _) = r.capture(&reused, 1).unwrap();
+        let (b, _) = r.capture(&centered, 1).unwrap();
+        let d = differing(&a, &b);
+        // Different references round differently right at the boundary.
+        assert!(d < 0.01, "zoom {zoom}: {:.2}% of pixels differ", d * 100.0);
+    }
+}
+
+/// After panning (reusing exact tiles) or zooming (recomputing over a
+/// resampled preview), the finished canvas must equal a fresh render.
+#[test]
+fn reused_canvas_matches_fresh_render() {
+    let (w, h) = (256, 160);
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    e.set_center_str("0", "1");
+    e.zoom_at_center(1e3);
+    e.set_iter_limit(2000);
+    let mut s = Scheduler::default();
+    run_to_completion(&mut s, &mut e, r.as_mut());
+
+    let changes: [(&str, fn(&mut Explorer)); 3] = [
+        ("pan", |e| e.pan_pixels(-37.0, 21.0)),
+        ("zoom in", |e| e.zoom_at(90.0, 50.0, 1.7)),
+        ("zoom out", |e| e.zoom_at(150.0, 100.0, 0.6)),
+    ];
+    for (what, change) in changes {
+        change(&mut e);
+        run_to_completion(&mut s, &mut e, r.as_mut());
+        let reused = r.snapshot().unwrap();
+        let (fresh, _) = r.capture(&e.frame_params(), 1).unwrap();
+        let d = differing(&reused, &fresh);
+        assert!(d < 0.002, "{what}: {:.3}% of pixels differ", d * 100.0);
+    }
+}
+
+#[test]
+fn stats_only_draw_leaves_canvas_untouched() {
+    let (w, h) = (128, 96);
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    let before = r.snapshot().unwrap();
+
+    // Different palette, so any write would show.
+    e.cycle_palette(true);
+    let p = e.frame_params();
+    let stats = r.draw(&p, &TileBatch::all(w, h, 4, Output::StatsOnly)).unwrap();
+    assert!(stats.samples > 0 && stats.max_escaped > 0, "{stats:?}");
+    assert!(r.snapshot().unwrap() == before, "stats-only draw wrote pixels");
+
+    r.draw(&p, &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    assert!(r.snapshot().unwrap() != before, "palette change should be visible");
+}
+
+/// Simulated continuous pinch-zoom through the seahorse valley, printing the
+/// iteration limit along the way. A measurement, not a pass/fail test.
+#[test]
+#[ignore]
+fn simulated_deep_zoom() {
+    let (w, h) = (1200, 800);
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    e.set_center_str(SEAHORSE.0, SEAHORSE.1);
+    e.zoom_at_center(1e10);
+    e.iter_limit = e.estimate_iter();
+    let mut s = Scheduler::default();
+    let start = std::time::Instant::now();
+    let mut next_report = 10.0;
+    while e.zoom() < 1e30 {
+        s.step(&mut e, r.as_mut()).unwrap();
+        e.zoom_at_center(1.05);
+        let decade = e.zoom().log10();
+        if decade >= next_report {
+            println!("zoom 1e{decade:.0}: iters {:>6}  ({:.1} s)", e.iter_limit, start.elapsed().as_secs_f64());
+            next_report += 2.0;
+        }
+    }
+    // Then stop and let it settle.
+    let settle = std::time::Instant::now();
+    while s.step(&mut e, r.as_mut()).unwrap() {}
+    println!("settled at 1e30: iters {} after {:.1} s", e.iter_limit, settle.elapsed().as_secs_f64());
+    println!("{}", e.hud(None, None));
+}

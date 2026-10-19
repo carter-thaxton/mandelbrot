@@ -1,9 +1,3 @@
-mod app;
-mod bigfixed;
-mod perturb;
-mod progressive;
-mod render;
-
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use winit::application::ApplicationHandler;
@@ -13,9 +7,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use app::{Explorer, Precision, PrecisionMode};
-use progressive::Scheduler;
-use render::Renderer;
+use mandelbrot::app::{self, Explorer, Precision, PrecisionMode};
+use mandelbrot::progressive::Scheduler;
+use mandelbrot::render::{self, Renderer};
 
 const HELP: &str = "\
 Mandelbrot explorer
@@ -320,58 +314,4 @@ fn main() {
     println!("{HELP}");
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.run_app(&mut App::new()).expect("event loop failed");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Fraction of pixels whose color differs noticeably between two images.
-    fn differing(a: &[u8], b: &[u8]) -> f64 {
-        let n = a.len() / 4;
-        let bad = a
-            .chunks(4)
-            .zip(b.chunks(4))
-            .filter(|(x, y)| (0..3).any(|i| x[i].abs_diff(y[i]) > 16))
-            .count();
-        bad as f64 / n as f64
-    }
-
-    /// Rendering against a reused, off-center reference (as happens while
-    /// panning) must match rendering against a fresh centered one.
-    #[test]
-    fn gpu_off_center_reference_matches_fresh() {
-        let mut renderer = render::create_headless().expect("Metal device");
-        for zoom in [1e8, 1e40] {
-            let mut panned = Explorer::new(320, 200);
-            // c = i: a boundary point with smooth surroundings at every depth,
-            // so any offset error shows up as a visibly shifted image.
-            panned.set_center_str("0", "1");
-            panned.zoom_at_center(zoom);
-            panned.set_iter_limit(4000);
-            panned.frame_params(); // creates the reference at this center
-            panned.pan_pixels(120.0, -70.0);
-            let reused = panned.frame_params();
-            assert!(reused.ref_offset != (0.0, 0.0), "reference should have been reused");
-
-            let mut fresh = Explorer::new(320, 200);
-            fresh.center = panned.center.clone();
-            fresh.scale = panned.scale;
-            fresh.set_iter_limit(4000);
-            let centered = fresh.frame_params();
-            // Only the truncation of the center to the needed precision.
-            let off = centered.ref_offset.0.abs().max(centered.ref_offset.1.abs());
-            assert!(off < centered.scale * 1e-6, "{off:e}");
-
-            let (a, _) = renderer.capture(&reused, 1).unwrap();
-            let (b, _) = renderer.capture(&centered, 1).unwrap();
-            if let Ok(dir) = std::env::var("MANDEL_TEST_DUMP") {
-                write_png(&format!("{dir}/reused_{zoom:e}.png"), &reused, &a).unwrap();
-                write_png(&format!("{dir}/fresh_{zoom:e}.png"), &centered, &b).unwrap();
-            }
-            let d = differing(&a, &b);
-            // Different references round differently right at the boundary.
-            assert!(d < 0.01, "zoom {zoom}: {:.2}% of pixels differ", d * 100.0);
-        }
-    }
 }

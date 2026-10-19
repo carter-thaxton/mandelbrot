@@ -394,16 +394,18 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                                 : -1.0;
         }
 
-        float3 rgb = float3(0.0);
-        if (mu >= 0.0) {
-            float t = mu * 0.02 * p.color_density;
-            rgb = palette(p.palette, t);
-        }
-        uint x1 = min(x0 + p.step, p.width);
-        uint y1 = p.stats_only ? y0 : min(y0 + p.step, p.height);
-        for (uint y = y0; y < y1; ++y) {
-            for (uint x = x0; x < x1; ++x) {
-                out.write(float4(rgb, 1.0), uint2(x, y));
+        if (!p.stats_only) {
+            float3 rgb = float3(0.0);
+            if (mu >= 0.0) {
+                float t = mu * 0.02 * p.color_density;
+                rgb = palette(p.palette, t);
+            }
+            uint x1 = min(x0 + p.step, p.width);
+            uint y1 = min(y0 + p.step, p.height);
+            for (uint y = y0; y < y1; ++y) {
+                for (uint x = x0; x < x1; ++x) {
+                    out.write(float4(rgb, 1.0), uint2(x, y));
+                }
             }
         }
     }

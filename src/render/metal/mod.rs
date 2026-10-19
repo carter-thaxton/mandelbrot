@@ -1,7 +1,7 @@
 //! Metal backend: the only module that touches objc2 / Metal / Core Animation.
 //!
-//! A compute kernel writes into a persistent canvas texture, which is blitted
-//! to the CAMetalLayer's drawable on every draw (so the layer is created with
+//! A compute kernel writes into a persistent canvas texture, which `present`
+//! blits to the CAMetalLayer's drawable (so the layer is created with
 //! `framebufferOnly = false`); no render pass or vertex pipeline is needed.
 //! A second kernel resamples the canvas into a spare texture when the view
 //! moves, and the two are swapped.
@@ -25,7 +25,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{FrameStats, GpuParams, Renderer, Reprojection, Result, TILE, TileBatch};
+use super::{FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch};
 use crate::app::FrameParams;
 use crate::perturb::ReferenceOrbit;
 
@@ -125,7 +125,7 @@ impl MetalRenderer {
         if batch.tiles.is_empty() {
             return Ok(0);
         }
-        let gpu = GpuParams { stats_only: batch.stats_only as u32, ..GpuParams::new(params, batch.step) };
+        let gpu = GpuParams::new(params, batch.step, batch.output);
         let per_side = (TILE / gpu.step) as usize;
         let reference = self.reference_buffer(params)?;
         // SAFETY: the buffer was created with room for one GpuStats, and the
@@ -276,33 +276,76 @@ impl Renderer for MetalRenderer {
 
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
         let samples = self.encode(&cmd, &canvas, &params, batch)?;
-
-        // Present the whole canvas (drawables don't keep earlier contents).
-        // Headless renderers (tests) just keep the canvas.
-        if let Some(drawable) = self.layer.as_ref().and_then(|l| l.nextDrawable()) {
-            let target = drawable.texture();
-            let w = canvas.width().min(target.width());
-            let h = canvas.height().min(target.height());
-            let blit = cmd.blitCommandEncoder().ok_or("failed to create blit encoder")?;
-            let origin = MTLOrigin { x: 0, y: 0, z: 0 };
-            // SAFETY: same pixel format, and the copied size fits both textures.
-            unsafe {
-                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                    &canvas, 0, 0, origin, MTLSize { width: w, height: h, depth: 1 },
-                    &target, 0, 0, origin,
-                );
-            }
-            blit.endEncoding();
-            cmd.presentDrawable(ProtocolObject::from_ref(&*drawable));
-        }
         self.finish(&cmd, samples)
+    }
+
+    fn present(&mut self) -> Result<()> {
+        // Headless renderers (tests, captures) have nowhere to present to.
+        let Some(layer) = &self.layer else { return Ok(()) };
+        let canvas = self.canvas.clone().ok_or("present() before resize()")?;
+        let Some(drawable) = layer.nextDrawable() else {
+            return Ok(()); // e.g. window minimized
+        };
+        // Copy the whole canvas: drawables don't keep earlier contents.
+        let target = drawable.texture();
+        let w = canvas.width().min(target.width());
+        let h = canvas.height().min(target.height());
+        let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
+        let blit = cmd.blitCommandEncoder().ok_or("failed to create blit encoder")?;
+        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+        // SAFETY: same pixel format, and the copied size fits both textures.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &canvas, 0, 0, origin, MTLSize { width: w, height: h, depth: 1 },
+                &target, 0, 0, origin,
+            );
+        }
+        blit.endEncoding();
+        cmd.presentDrawable(ProtocolObject::from_ref(&*drawable));
+        // No wait: later work on this queue is ordered after the copy.
+        cmd.commit();
+        Ok(())
+    }
+
+    fn snapshot(&mut self) -> Result<Vec<u8>> {
+        let canvas = self.canvas.clone().ok_or("snapshot() before resize()")?;
+        let (w, h) = (canvas.width(), canvas.height());
+        // The canvas is GPU-private: copy it somewhere the CPU can read.
+        let shared = self.new_texture(w, h, MTLPixelFormat::BGRA8Unorm, true)?;
+        let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
+        let blit = cmd.blitCommandEncoder().ok_or("failed to create blit encoder")?;
+        let origin = MTLOrigin { x: 0, y: 0, z: 0 };
+        let size = MTLSize { width: w, height: h, depth: 1 };
+        // SAFETY: same size and pixel format.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                &canvas, 0, 0, origin, size, &shared, 0, 0, origin,
+            );
+        }
+        blit.endEncoding();
+        cmd.commit();
+        cmd.waitUntilCompleted();
+        let mut pixels = vec![0u8; w * h * 4];
+        // SAFETY: `pixels` holds exactly h rows of w*4 bytes, matching the region.
+        unsafe {
+            shared.getBytes_bytesPerRow_fromRegion_mipmapLevel(
+                NonNull::new(pixels.as_mut_ptr().cast()).unwrap(),
+                w * 4,
+                MTLRegion { origin, size },
+                0,
+            );
+        }
+        for px in pixels.chunks_mut(4) {
+            px.swap(0, 2); // BGRA -> RGBA
+        }
+        Ok(pixels)
     }
 
     fn capture(&mut self, params: &FrameParams, step: u32) -> Result<(Vec<u8>, FrameStats)> {
         let (w, h) = (params.width as usize, params.height as usize);
         let texture = self.new_texture(w, h, MTLPixelFormat::RGBA8Unorm, true)?;
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
-        let batch = TileBatch::all(params.width, params.height, step);
+        let batch = TileBatch::all(params.width, params.height, step, Output::Pixels);
         let samples = self.encode(&cmd, &texture, params, &batch)?;
         let stats = self.finish(&cmd, samples)?;
 
@@ -383,127 +426,4 @@ fn attach_layer<W: HasWindowHandle>(window: &W, device: &Device) -> Result<Retai
     layer.setFrame(root.bounds());
     root.addSublayer(&layer);
     Ok(layer)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app::Explorer;
-    use crate::progressive::Scheduler;
-    use objc2_metal::{MTLBlitCommandEncoder as _, MTLCommandBuffer as _};
-
-    impl MetalRenderer {
-        /// Canvas contents as RGBA8 (the canvas itself is BGRA8).
-        fn read_canvas(&self) -> Vec<u8> {
-            let canvas = self.canvas.as_ref().unwrap();
-            let (w, h) = (canvas.width(), canvas.height());
-            let shared = self.new_texture(w, h, MTLPixelFormat::BGRA8Unorm, true).unwrap();
-            let cmd = self.queue.commandBuffer().unwrap();
-            let blit = cmd.blitCommandEncoder().unwrap();
-            let origin = MTLOrigin { x: 0, y: 0, z: 0 };
-            let size = MTLSize { width: w, height: h, depth: 1 };
-            unsafe {
-                blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
-                    canvas, 0, 0, origin, size, &shared, 0, 0, origin,
-                );
-            }
-            blit.endEncoding();
-            cmd.commit();
-            cmd.waitUntilCompleted();
-            let mut px = vec![0u8; w * h * 4];
-            unsafe {
-                shared.getBytes_bytesPerRow_fromRegion_mipmapLevel(
-                    NonNull::new(px.as_mut_ptr().cast()).unwrap(),
-                    w * 4,
-                    MTLRegion { origin, size },
-                    0,
-                );
-            }
-            for p in px.chunks_mut(4) {
-                p.swap(0, 2);
-            }
-            px
-        }
-    }
-
-    fn differing(a: &[u8], b: &[u8]) -> f64 {
-        let bad = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| (0..3).any(|i| x[i].abs_diff(y[i]) > 16)).count();
-        bad as f64 / (a.len() / 4) as f64
-    }
-
-    fn finish(s: &mut Scheduler, e: &mut Explorer, r: &mut MetalRenderer) {
-        for _ in 0..100_000 {
-            if !s.step(e, r).unwrap() {
-                return;
-            }
-        }
-        panic!("scheduler never finished");
-    }
-
-    /// Simulated continuous pinch-zoom through the seahorse valley, printing
-    /// the iteration limit along the way. A measurement, not a pass/fail test:
-    /// `cargo test --release simulated_deep_zoom -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn simulated_deep_zoom() {
-        let (w, h) = (1200, 800);
-        let mut r = MetalRenderer::new(None::<&crate::render::NoWindow>).unwrap();
-        r.resize(w, h, 1.0);
-        let mut e = Explorer::new(w, h);
-        e.set_center_str("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
-        e.zoom_at_center(1e10);
-        e.iter_limit = e.estimate_iter();
-        let mut s = Scheduler::default();
-        let start = std::time::Instant::now();
-        let mut next_report = 10.0;
-        while e.zoom() < 1e30 {
-            s.step(&mut e, &mut r).unwrap();
-            e.zoom_at_center(1.05);
-            let decade = e.zoom().log10();
-            if decade >= next_report {
-                println!("zoom 1e{decade:.0}: iters {:>6}  ({:.1} s)", e.iter_limit, start.elapsed().as_secs_f64());
-                next_report += 2.0;
-            }
-        }
-        // Then stop and let it settle.
-        let settle = std::time::Instant::now();
-        while s.step(&mut e, &mut r).unwrap() {}
-        println!("settled at 1e30: iters {} after {:.1} s", e.iter_limit, settle.elapsed().as_secs_f64());
-        println!("{}", e.hud(None, None));
-        let mut fresh = Explorer::new(w, h);
-        fresh.center = e.center.clone();
-        fresh.scale = e.scale;
-        fresh.set_iter_limit(e.iter_limit);
-        let p = fresh.frame_params();
-        let (_, st) = r.capture(&p, 1).unwrap();
-        println!("fresh reference: {:.0} ms  {}", st.gpu_ms, fresh.hud(None, None));
-    }
-
-    /// After panning (reusing exact tiles) or zooming (recomputing over a
-    /// resampled preview), the finished canvas must equal a fresh render.
-    #[test]
-    fn reused_canvas_matches_fresh_render() {
-        let (w, h) = (256, 160);
-        let mut r = MetalRenderer::new(None::<&crate::render::NoWindow>).unwrap();
-        r.resize(w, h, 1.0);
-        let mut e = Explorer::new(w, h);
-        e.set_center_str("0", "1");
-        e.zoom_at_center(1e3);
-        e.set_iter_limit(2000);
-        let mut s = Scheduler::default();
-        finish(&mut s, &mut e, &mut r);
-
-        for (what, change) in [
-            ("pan", Box::new(|e: &mut Explorer| e.pan_pixels(-37.0, 21.0)) as Box<dyn Fn(&mut Explorer)>),
-            ("zoom in", Box::new(|e: &mut Explorer| e.zoom_at(90.0, 50.0, 1.7))),
-            ("zoom out", Box::new(|e: &mut Explorer| e.zoom_at(150.0, 100.0, 0.6))),
-        ] {
-            change(&mut e);
-            finish(&mut s, &mut e, &mut r);
-            let reused = r.read_canvas();
-            let (fresh, _) = r.capture(&e.frame_params(), 1).unwrap();
-            let d = differing(&reused, &fresh);
-            assert!(d < 0.002, "{what}: {:.3}% of pixels differ", d * 100.0);
-        }
-    }
 }

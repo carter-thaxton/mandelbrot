@@ -8,7 +8,7 @@
 use std::cmp::Ordering;
 use std::ops::{Add, Mul, Neg, Sub};
 
-/// value = (-1)^neg * Σ limbs[i] * 2^(64 * (i - frac)), with limbs stored
+/// `value = (-1)^neg * Σ limbs[i] * 2^(64 * (i - frac))`, with limbs stored
 /// little-endian: `limbs[0]` is the least significant fraction limb and the
 /// last limb is the integer part.
 #[derive(Clone, Debug, PartialEq, Eq)]
