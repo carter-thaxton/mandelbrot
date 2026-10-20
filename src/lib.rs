@@ -8,6 +8,8 @@
 //!   Metal backend
 //! - [`bookmarks`], [`flight`]: saved places and smooth zoom-and-pan flights
 //!   between them
+//! - [`harness`]: scripted scenarios for measuring and comparing the
+//!   progressive renderer's behavior
 //! - [`perturb`], [`bigfixed`]: deep-zoom math (reference orbits, series
 //!   approximation, arbitrary-precision fixed point)
 //!
@@ -18,6 +20,7 @@ pub mod app;
 pub mod bigfixed;
 pub mod bookmarks;
 pub mod flight;
+pub mod harness;
 pub mod perturb;
 pub mod progressive;
 pub mod render;

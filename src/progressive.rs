@@ -379,6 +379,12 @@ impl Scheduler {
     /// Do one frame's worth of work. Returns true if more work remains (the
     /// caller should request another redraw).
     pub fn step(&mut self, explorer: &mut Explorer, renderer: &mut dyn Renderer) -> Result<bool> {
+        self.step_at(std::time::Instant::now(), explorer, renderer)
+    }
+
+    /// [`Scheduler::step`] at time `now` (probes are spaced by this clock),
+    /// for replaying input on a simulated clock.
+    pub fn step_at(&mut self, now: std::time::Instant, explorer: &mut Explorer, renderer: &mut dyn Renderer) -> Result<bool> {
         let params = explorer.frame_params();
         let colors = explorer.colors();
         let moved = self.sync(View::of(explorer), &params, renderer)?;
@@ -387,7 +393,7 @@ impl Scheduler {
 
         if self.probe_due
             && explorer.auto_iter
-            && self.last_probe.is_none_or(|t| t.elapsed() >= self.probe_interval.unwrap_or(PROBE_INTERVAL))
+            && self.last_probe.is_none_or(|t| now.duration_since(t) >= self.probe_interval.unwrap_or(PROBE_INTERVAL))
         {
             // Spend this frame on whole-view statistics, which don't change
             // the canvas.
@@ -414,7 +420,7 @@ impl Scheduler {
                 self.probe_stats = FrameStats::default();
             }
             self.probe_due = false;
-            self.last_probe = Some(std::time::Instant::now());
+            self.last_probe = Some(now);
             return Ok(true);
         }
 

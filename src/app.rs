@@ -173,6 +173,10 @@ pub struct Explorer {
     pub auto_iter: bool,
     /// Use the series approximation to skip early iterations (Perturbation).
     pub series_skip: bool,
+    /// Compute better-centered reference orbits on a background thread
+    /// (false: synchronously, adopted on the next frame as if the thread had
+    /// just finished, which makes runs reproducible).
+    pub background_references: bool,
     /// Zoom-driven change to `iter_limit` not yet applied (applied in >=5%
     /// steps so continuous zooming doesn't change it every frame).
     iter_drift: f64,
@@ -205,6 +209,7 @@ impl Explorer {
             iter_limit: MIN_ITER,
             auto_iter: true,
             series_skip: true,
+            background_references: true,
             iter_drift: 1.0,
             drag_anchor: None,
             cursor: (0.0, 0.0),
@@ -489,9 +494,14 @@ impl Explorer {
         if dist > REF_IDEAL_VIEWS && self.pending.is_none() {
             let (tx, rx) = mpsc::channel();
             let (c, n) = (self.center.clone(), ref_iters);
-            std::thread::spawn(move || {
+            let job = move || {
                 let _ = tx.send(RefState::compute(c, limbs, n));
-            });
+            };
+            if self.background_references {
+                std::thread::spawn(job);
+            } else {
+                job();
+            }
             self.pending = Some(rx);
         }
         (r.orbit.clone(), offset)
