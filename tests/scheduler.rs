@@ -24,7 +24,7 @@ fn fresh_view_previews_then_refines_every_tile_once() {
     let mut seen = std::collections::HashMap::new();
     for b in r.batches.iter().filter(|b| b.step == 1 && b.output == Output::Pixels) {
         for t in &b.tiles {
-            *seen.entry(*t).or_insert(0) += 1;
+            *seen.entry(t.origin).or_insert(0) += 1;
         }
     }
     let total = (400u32.div_ceil(TILE) * 300u32.div_ceil(TILE)) as usize;

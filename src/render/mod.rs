@@ -34,11 +34,30 @@ pub enum Output {
     StatsOnly,
 }
 
+/// One tile to compute. Layout matches `TileJob` in the shader.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TileJob {
+    /// Top-left pixel (multiples of [`TILE`]).
+    pub origin: [u32; 2],
+    /// Iteration limit for this tile's samples, at most
+    /// [`FrameParams::max_iter`] (the reference orbit and the series skip
+    /// are sized for that). A limit at or below the series skip leaves the
+    /// tile's samples unescaped.
+    pub max_iter: u32,
+    _pad: u32,
+}
+
+impl TileJob {
+    pub fn new(origin: [u32; 2], max_iter: u32) -> Self {
+        Self { origin, max_iter, _pad: 0 }
+    }
+}
+
 /// Which tiles of the canvas to compute, how coarsely, and what to produce.
 #[derive(Clone, Debug)]
 pub struct TileBatch {
-    /// Top-left pixel of each tile (multiples of [`TILE`]).
-    pub tiles: Vec<[u32; 2]>,
+    pub tiles: Vec<TileJob>,
     /// Sample every `step` pixels and fill step x step blocks (1 = full res).
     /// A power of two no larger than [`TILE`].
     pub step: u32,
@@ -46,14 +65,14 @@ pub struct TileBatch {
 }
 
 impl TileBatch {
-    pub fn new(tiles: Vec<[u32; 2]>, step: u32, output: Output) -> Self {
+    pub fn new(tiles: Vec<TileJob>, step: u32, output: Output) -> Self {
         Self { tiles, step, output }
     }
 
-    /// Every tile of a `width` x `height` canvas.
-    pub fn all(width: u32, height: u32, step: u32, output: Output) -> Self {
+    /// Every tile of a `width` x `height` canvas, all with limit `max_iter`.
+    pub fn all(width: u32, height: u32, max_iter: u32, step: u32, output: Output) -> Self {
         let tiles = (0..height.div_ceil(TILE))
-            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| [tx * TILE, ty * TILE]))
+            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| TileJob::new([tx * TILE, ty * TILE], max_iter)))
             .collect();
         Self::new(tiles, step, output)
     }
@@ -80,7 +99,7 @@ pub struct FrameStats {
     pub samples: u64,
     /// Highest iteration count among escaped samples.
     pub max_escaped: u32,
-    /// Escaped samples that needed more than 3/4 of the iteration limit.
+    /// Escaped samples that needed more than 3/4 of their tile's limit.
     pub near_limit: u32,
     /// Samples that never escaped (in the set, or under-iterated).
     pub interior: u32,
@@ -147,9 +166,11 @@ pub fn create_headless() -> Result<Box<dyn Renderer>> {
 }
 
 /// Uniform block shared with the GPU kernel. Layout must match `Params` in the
-/// shader (float2 fields are 8-byte aligned there). Doubles are split into
-/// hi/lo f32 pairs since Apple GPUs (and WGSL) have no f64.
-#[repr(C)]
+/// shader, where float2 fields are 8-byte aligned, which makes the whole
+/// struct 8-aligned (hence `align(8)`: Rust's `[f32; 2]` is only 4-aligned).
+/// Doubles are split into hi/lo f32 pairs since Apple GPUs (and WGSL) have
+/// no f64.
+#[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GpuParams {
     pub center_x: [f32; 2],
@@ -157,7 +178,8 @@ pub struct GpuParams {
     pub scale: [f32; 2],
     pub width: u32,
     pub height: u32,
-    pub max_iter: u32,
+    /// Nonzero: compute statistics only, write no pixels ([`Output`]).
+    pub stats_only: u32,
     pub precision: u32,
     /// Number of reference orbit points bound at buffer(1) (Perturbation).
     pub ref_len: u32,
@@ -173,8 +195,6 @@ pub struct GpuParams {
     pub sa_n: u32,
     pub sa_a_m: [f32; 2],
     pub sa_a_e: i32,
-    /// Nonzero: compute statistics only, write no pixels ([`Output`]).
-    pub stats_only: u32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -193,7 +213,6 @@ impl GpuParams {
             scale: split_f64(p.scale),
             width: p.width,
             height: p.height,
-            max_iter: p.max_iter,
             precision: match p.precision {
                 Precision::F32 => 0,
                 Precision::DoubleFloat => 1,
@@ -243,8 +262,18 @@ mod tests {
             offset_of!(GpuParams, sa_a_m),
         ];
         assert!(float2_fields.iter().all(|o| o % 8 == 0), "{float2_fields:?}");
+        assert_eq!(offset_of!(GpuParams, stats_only), 32);
         assert_eq!(offset_of!(GpuParams, ref_off_m), 56);
         assert_eq!(offset_of!(GpuParams, sa_a_m), 72);
+        // 84 bytes of fields, padded to the shader's 8-byte alignment.
         assert_eq!(size_of::<GpuParams>(), 88);
+    }
+
+    /// `TileJob` is read by the shader as { uint2 origin; uint max_iter; uint _pad; }.
+    #[test]
+    fn tile_job_layout_matches_the_shader() {
+        assert_eq!(offset_of!(TileJob, origin), 0);
+        assert_eq!(offset_of!(TileJob, max_iter), 8);
+        assert_eq!(size_of::<TileJob>(), 16);
     }
 }

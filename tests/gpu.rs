@@ -5,10 +5,10 @@
 //! Also holds an ignored measurement, `simulated_deep_zoom`:
 //! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
 
-use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place};
+use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place, Precision, PrecisionMode};
 use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
-use mandelbrot::render::{self, Output, Renderer, TileBatch};
+use mandelbrot::render::{self, Output, Renderer, TILE, TileBatch, TileJob};
 
 const SEAHORSE: (&str, &str) = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
 
@@ -102,19 +102,61 @@ fn stats_only_draw_leaves_canvas_untouched() {
     let mut r = renderer(w, h);
     let mut e = Explorer::new(w, h);
     let colors = e.colors();
-    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, e.iter_limit, 1, Output::Pixels)).unwrap();
     let before = r.snapshot(&colors).unwrap();
 
     // Far fewer iterations change mu (more of the image goes black), so any
     // write would show.
     e.set_iter_limit(16);
     let p = e.frame_params();
-    let stats = r.draw(&p, &TileBatch::all(w, h, 4, Output::StatsOnly)).unwrap();
+    let stats = r.draw(&p, &TileBatch::all(w, h, p.max_iter, 4, Output::StatsOnly)).unwrap();
     assert!(stats.samples > 0 && stats.max_escaped > 0, "{stats:?}");
     assert!(r.snapshot(&colors).unwrap() == before, "stats-only draw wrote pixels");
 
-    r.draw(&p, &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    r.draw(&p, &TileBatch::all(w, h, p.max_iter, 1, Output::Pixels)).unwrap();
     assert!(r.snapshot(&colors).unwrap() != before, "the iteration change should be visible");
+}
+
+/// Each tile iterates to its own limit: on a checkerboard of two limits,
+/// every tile comes out exactly as a whole render at its tile's limit, and
+/// the statistics judge samples against their own tile's limit.
+#[test]
+fn tiles_iterate_to_their_own_limits() {
+    let (w, h) = (160, 96);
+    let mut r = renderer(w, h);
+    let cases = [(Precision::F32, 1e3, 100, 2000), (Precision::Perturbation, 1e8, 1500, 6000)];
+    for (precision, zoom, low, high) in cases {
+        let mut e = Explorer::new(w, h);
+        e.set_center_str(SEAHORSE.0, SEAHORSE.1);
+        e.zoom_at_center(zoom);
+        e.precision_mode = PrecisionMode::Forced(precision);
+        e.series_skip = false; // its skip depends on the frame's limit
+        e.set_iter_limit(high);
+        let colors = e.colors();
+        let frame = e.frame_params();
+        let at_low = mandelbrot::app::FrameParams { max_iter: low, ..frame.clone() };
+        let (high_px, _) = r.capture(&frame, 1, &colors).unwrap();
+        let (low_px, low_stats) = r.capture(&at_low, 1, &colors).unwrap();
+        assert!(differing(&high_px, &low_px) > 0.02, "{precision:?}: the limits should matter here");
+
+        let is_low = |x: u32, y: u32| (x / TILE + y / TILE) % 2 == 0;
+        let all = TileBatch::all(w, h, high, 1, Output::Pixels);
+        let jobs = all.tiles.iter().map(|t| TileJob::new(t.origin, if is_low(t.origin[0], t.origin[1]) { low } else { high }));
+        r.draw(&frame, &TileBatch::new(jobs.collect(), 1, Output::Pixels)).unwrap();
+        let mixed = r.snapshot(&colors).unwrap();
+        for (i, px) in mixed.chunks(4).enumerate() {
+            let (x, y) = (i as u32 % w, i as u32 / w);
+            let want = if is_low(x, y) { &low_px } else { &high_px };
+            assert_eq!(px, &want[i * 4..i * 4 + 4], "{precision:?}: pixel ({x}, {y})");
+        }
+
+        // Every tile at the low limit within the high frame: the same
+        // statistics as a frame at the low limit.
+        let s = r.draw(&frame, &TileBatch::all(w, h, low, 1, Output::StatsOnly)).unwrap();
+        let key = |s: &render::FrameStats| (s.samples, s.max_escaped, s.near_limit, s.interior);
+        assert_eq!(key(&s), key(&low_stats), "{precision:?}");
+        assert!(low_stats.near_limit > 0, "{precision:?}: the test needs samples near the low limit");
+    }
 }
 
 /// Colors are applied when showing the canvas, not when computing it: the
@@ -125,7 +167,7 @@ fn colors_apply_at_present_time() {
     let (w, h) = (160, 120);
     let mut r = renderer(w, h);
     let mut e = Explorer::new(w, h);
-    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, e.iter_limit, 1, Output::Pixels)).unwrap();
     let base = e.colors();
     let image = r.snapshot(&base).unwrap();
 
@@ -151,7 +193,7 @@ fn every_palette_repeats_after_the_palette_period() {
     let (w, h) = (160, 120);
     let mut r = renderer(w, h);
     let mut e = Explorer::new(w, h);
-    r.draw(&e.frame_params(), &TileBatch::all(w, h, 1, Output::Pixels)).unwrap();
+    r.draw(&e.frame_params(), &TileBatch::all(w, h, e.iter_limit, 1, Output::Pixels)).unwrap();
     for palette in 0..PALETTE_COUNT {
         let colors = |offset| Colors { palette, density: 1.0, offset };
         let image = r.snapshot(&colors(0.0)).unwrap();

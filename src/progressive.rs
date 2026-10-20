@@ -32,7 +32,7 @@
 
 use crate::app::{Colors, Explorer, FrameParams, MIN_DECISION_SAMPLES, Precision};
 use crate::bigfixed::Fixed;
-use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
+use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileJob};
 
 /// GPU time to aim for per frame (ms). Leaves headroom inside a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 12.0;
@@ -402,7 +402,7 @@ impl Scheduler {
             }
             let canvas = self.canvas.as_ref().unwrap();
             let step = self.preview_step(&params).max(PROBE_MIN_STEP);
-            let probe = TileBatch::all(canvas.view.width, canvas.view.height, step, Output::StatsOnly);
+            let probe = TileBatch::all(canvas.view.width, canvas.view.height, params.max_iter, step, Output::StatsOnly);
             let stats = renderer.draw(&params, &probe)?;
             self.record(&stats);
             self.probe_stats.merge(&stats);
@@ -432,7 +432,9 @@ impl Scheduler {
             return Ok(false);
         };
         let canvas = self.canvas.as_ref().unwrap();
-        let batch = TileBatch::new(tiles.iter().map(|&i| canvas.origin(i)).collect(), step, Output::Pixels);
+        // Every tile at the frame's limit, for now.
+        let jobs = tiles.iter().map(|&i| TileJob::new(canvas.origin(i), params.max_iter)).collect();
+        let batch = TileBatch::new(jobs, step, Output::Pixels);
         let total = canvas.tiles.len();
 
         let stats = renderer.draw(&params, &batch)?;

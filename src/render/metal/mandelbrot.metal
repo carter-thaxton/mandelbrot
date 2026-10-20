@@ -19,7 +19,7 @@ struct Params {
     float2 scale;      // (hi, lo) complex units per pixel
     uint   width;
     uint   height;
-    uint   max_iter;
+    uint   stats_only; // nonzero: gather statistics, write no pixels
     uint   precision;
     uint   ref_len;
     float  scale_m;    // scale as floatexp: scale_m * 2^scale_e
@@ -30,7 +30,13 @@ struct Params {
     uint   sa_n;       // series approximation: start at iteration sa_n...
     float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
     int    sa_a_e;
-    uint   stats_only; // nonzero: gather statistics, write no pixels
+};
+
+// One tile to compute. Must match `TileJob` in src/render/mod.rs.
+struct TileJob {
+    uint2 origin;   // top-left pixel
+    uint  max_iter; // iteration limit for this tile (at most the frame's, which the reference covers)
+    uint  _pad;
 };
 
 /// Canvas value for samples that never escaped (in the set, or not computed).
@@ -41,7 +47,7 @@ constant uint TILE = 16; // must match TILE in src/render/mod.rs
 // Must match `GpuStats` in render/metal/mod.rs.
 struct Stats {
     atomic_uint max_escaped;  // highest iteration count among escaped samples
-    atomic_uint near_limit;   // escaped samples needing > 3/4 of max_iter
+    atomic_uint near_limit;   // escaped samples needing > 3/4 of their tile's limit
     atomic_uint interior;     // samples that never escaped
     uint        _pad;
 };
@@ -373,14 +379,15 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
                        device const RefPoint* ref         [[buffer(1)]],
                        device Stats& stats                [[buffer(2)]],
-                       device const uint2* tiles          [[buffer(3)]],
+                       device const TileJob* tiles        [[buffer(3)]],
                        uint3 gid                          [[thread_position_in_grid]])
 {
     // Grid: (TILE/step, TILE/step, tile count). Each thread computes one
     // sample at the center of a step x step block within its tile.
-    uint2 tile = tiles[gid.z];
-    uint x0 = tile.x + gid.x * p.step;
-    uint y0 = tile.y + gid.y * p.step;
+    TileJob job = tiles[gid.z];
+    uint max_iter = job.max_iter;
+    uint x0 = job.origin.x + gid.x * p.step;
+    uint y0 = job.origin.y + gid.y * p.step;
     // No early return: every thread must take part in the SIMD reductions.
     bool valid = gid.x * p.step < TILE && gid.y * p.step < TILE && x0 < p.width && y0 < p.height;
 
@@ -397,17 +404,17 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         if (p.precision == 0) {
             float2 c = float2(p.center_x.x + px * p.scale.x,
                               p.center_y.x + py * p.scale.x);
-            mu = iterate_f32(c, p.max_iter, max(period_eps, 1e-7));
+            mu = iterate_f32(c, max_iter, max(period_eps, 1e-7));
         } else if (p.precision == 1) {
             df cx = df_add(p.center_x, df_mul_f(p.scale, px));
             df cy = df_add(p.center_y, df_mul_f(p.scale, py));
-            mu = iterate_df(cx, cy, p.max_iter, period_eps);
+            mu = iterate_df(cx, cy, max_iter, period_eps);
         } else {
             // dc = c - C: pixel offset from the view center, plus the view
             // center's offset from the (possibly off-center) reference point.
             cfe dc = cfe_add(cfe_make(float2(px, py) * p.scale_m, p.scale_e),
                              cfe{p.ref_off_m, p.ref_off_e});
-            mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, p.max_iter,
+            mu = p.ref_len >= 2 ? iterate_perturb(dc, ref, p.ref_len, max_iter,
                                                   p.sa_n, cfe{p.sa_a_m, p.sa_a_e})
                                 : -1.0;
         }
@@ -429,7 +436,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
     bool escaped = valid && mu >= 0.0;
     uint n = escaped ? uint(mu) : 0;
     uint group_max = simd_max(n);
-    uint group_near = simd_sum(uint(escaped && n > p.max_iter / 4 * 3));
+    uint group_near = simd_sum(uint(escaped && n > max_iter / 4 * 3));
     uint group_interior = simd_sum(uint(valid && !escaped));
     if (simd_is_first()) {
         atomic_fetch_max_explicit(&stats.max_escaped, group_max, memory_order_relaxed);
