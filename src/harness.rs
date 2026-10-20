@@ -36,7 +36,7 @@ use crate::app::{Colors, Explorer, FrameParams, MAX_ITER, Place};
 use crate::bookmarks::PRESETS;
 use crate::flight::Flight;
 use crate::progressive::Scheduler;
-use crate::render::{FrameStats, Output, Renderer, Reprojection, Result, TileBatch};
+use crate::render::{BatchStats, FrameStats, Output, Renderer, Reprojection, Result, TileBatch};
 
 pub const FPS: f64 = 120.0;
 /// Frame time at FPS (ms); longer frames count as jank.
@@ -290,9 +290,10 @@ impl Renderer for Recorder<'_> {
         self.inner.resize(width, height, scale_factor)
     }
 
-    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
+    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<BatchStats> {
         self.hash_draw(params, batch);
-        let mut stats = self.inner.draw(params, batch)?;
+        let mut batch_stats = self.inner.draw(params, batch)?;
+        let stats = &mut batch_stats.total;
         if let Some(cost) = self.model_cost {
             stats.gpu_ms = stats.samples as f64 * params.max_iter as f64 * cost;
         }
@@ -309,7 +310,7 @@ impl Renderer for Recorder<'_> {
             Output::StatsOnly => self.log.stats_draws += 1,
         }
         self.params = Some(params.clone());
-        Ok(stats)
+        Ok(batch_stats)
     }
 
     fn present(&mut self, colors: &Colors) -> Result<()> {

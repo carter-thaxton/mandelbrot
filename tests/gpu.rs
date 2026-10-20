@@ -8,7 +8,7 @@
 use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place, Precision, PrecisionMode};
 use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
-use mandelbrot::render::{self, Output, Renderer, TILE, TileBatch, TileJob};
+use mandelbrot::render::{self, Output, Renderer, TILE, TileBatch, TileJob, TileStats};
 
 const SEAHORSE: (&str, &str) = ("-0.743643887037158704752191506114774", "0.131825904205311970493132056385139");
 
@@ -109,7 +109,7 @@ fn stats_only_draw_leaves_canvas_untouched() {
     // write would show.
     e.set_iter_limit(16);
     let p = e.frame_params();
-    let stats = r.draw(&p, &TileBatch::all(w, h, p.max_iter, 4, Output::StatsOnly)).unwrap();
+    let stats = r.draw(&p, &TileBatch::all(w, h, p.max_iter, 4, Output::StatsOnly)).unwrap().total;
     assert!(stats.samples > 0 && stats.max_escaped > 0, "{stats:?}");
     assert!(r.snapshot(&colors).unwrap() == before, "stats-only draw wrote pixels");
 
@@ -139,7 +139,7 @@ fn tiles_iterate_to_their_own_limits() {
         let (low_px, low_stats) = r.capture(&at_low, 1, &colors).unwrap();
         assert!(differing(&high_px, &low_px) > 0.02, "{precision:?}: the limits should matter here");
 
-        let is_low = |x: u32, y: u32| (x / TILE + y / TILE) % 2 == 0;
+        let is_low = |x: u32, y: u32| (x / TILE + y / TILE).is_multiple_of(2);
         let all = TileBatch::all(w, h, high, 1, Output::Pixels);
         let jobs = all.tiles.iter().map(|t| TileJob::new(t.origin, if is_low(t.origin[0], t.origin[1]) { low } else { high }));
         r.draw(&frame, &TileBatch::new(jobs.collect(), 1, Output::Pixels)).unwrap();
@@ -152,11 +152,89 @@ fn tiles_iterate_to_their_own_limits() {
 
         // Every tile at the low limit within the high frame: the same
         // statistics as a frame at the low limit.
-        let s = r.draw(&frame, &TileBatch::all(w, h, low, 1, Output::StatsOnly)).unwrap();
+        let s = r.draw(&frame, &TileBatch::all(w, h, low, 1, Output::StatsOnly)).unwrap().total;
         let key = |s: &render::FrameStats| (s.samples, s.max_escaped, s.near_limit, s.interior);
         assert_eq!(key(&s), key(&low_stats), "{precision:?}");
         assert!(low_stats.near_limit > 0, "{precision:?}: the test needs samples near the low limit");
     }
+}
+
+/// Each tile's statistics are its own: the same whatever else is in the
+/// batch, or where. (At coarse steps several tiles share a threadgroup and
+/// even a SIMD group, so a reduction that mixed them would show here.)
+#[test]
+fn tile_stats_do_not_depend_on_the_rest_of_the_batch() {
+    let (w, h) = (200, 136); // 13 x 9 tiles, the last row and column partial
+    let mut r = renderer(w, h);
+    let mut e = Explorer::new(w, h);
+    e.set_center_str(SEAHORSE.0, SEAHORSE.1);
+    e.zoom_at_center(300.0);
+    e.set_iter_limit(3000);
+    let p = e.frame_params();
+    for step in [1, 2, 4, 8, 16] {
+        let all = TileBatch::all(w, h, p.max_iter, step, Output::StatsOnly);
+        let together = r.draw(&p, &all).unwrap();
+        assert_eq!(together.tiles.len(), all.tiles.len());
+
+        let reversed: Vec<TileJob> = all.tiles.iter().rev().copied().collect();
+        let mut backwards = r.draw(&p, &TileBatch::new(reversed, step, Output::StatsOnly)).unwrap().tiles;
+        backwards.reverse();
+        assert_eq!(together.tiles, backwards, "step {step}: order changed the stats");
+
+        for i in (0..all.tiles.len()).step_by(7) {
+            let alone = r.draw(&p, &TileBatch::new(vec![all.tiles[i]], step, Output::StatsOnly)).unwrap();
+            assert_eq!(together.tiles[i], alone.tiles[0], "step {step}, tile {:?}", all.tiles[i].origin);
+        }
+
+        for t in &together.tiles {
+            assert!(t.interior <= t.samples && t.near_limit <= t.samples - t.interior, "{t:?}");
+            assert!(t.rough + t.edge <= t.pairs, "{t:?}");
+            assert!(t.escaped_iters as u64 <= (t.samples - t.interior) as u64 * t.max_escaped as u64, "{t:?}");
+        }
+        // (At step 16 a tile is a single sample: no pairs.)
+        if step < TILE {
+            assert!(together.tiles.iter().any(|t| t.edge > 0), "step {step}: the view has a boundary");
+        }
+        let samples: u32 = together.tiles.iter().map(|t| t.samples).sum();
+        let grid = |n: u32| n.div_ceil(TILE) * TILE.div_ceil(step) - (n.div_ceil(TILE) * TILE - n) / step;
+        assert_eq!(samples, grid(w) * grid(h), "step {step}");
+    }
+}
+
+/// Roughness counts adjacent escaped samples whose mu differs by more than
+/// the batch's threshold; edges count escaped samples next to interior ones.
+#[test]
+fn rough_and_edge_pairs_follow_their_definitions() {
+    let (w, h) = (96, 64);
+    let mut r = renderer(w, h);
+    // Far outside the set: everything escapes, smoothly.
+    let mut outside = Explorer::new(w, h);
+    outside.set_center_str("2", "2");
+    outside.zoom_at_center(10.0);
+    let p = outside.frame_params();
+    let mut batch = TileBatch::all(w, h, p.max_iter, 1, Output::StatsOnly);
+    let tiles = |r: &mut Box<dyn Renderer>, b: &TileBatch| r.draw(&p, b).unwrap().tiles;
+    for t in tiles(&mut r, &batch) {
+        assert_eq!((t.interior, t.rough, t.edge), (0, 0, 0), "{t:?}");
+    }
+    // A negative threshold makes every escaped pair rough.
+    batch.rough_mu = -1.0;
+    for t in tiles(&mut r, &batch) {
+        assert_eq!(t.rough, t.pairs, "{t:?}");
+    }
+
+    // Across the main cardioid's edge: interior next to escaped samples.
+    let mut edge = Explorer::new(w, h);
+    edge.set_center_str("0.25", "0");
+    edge.zoom_at_center(50.0);
+    let p = edge.frame_params();
+    let batch = TileBatch::all(w, h, p.max_iter, 1, Output::StatsOnly);
+    let stats = r.draw(&p, &batch).unwrap().tiles;
+    let total = |f: fn(&TileStats) -> u32| stats.iter().map(f).sum::<u32>();
+    assert!(total(|t| t.edge) > 0 && total(|t| t.interior) > 0);
+    // An infinite threshold leaves nothing rough.
+    let calm = TileBatch { rough_mu: f32::INFINITY, ..batch };
+    assert_eq!(r.draw(&p, &calm).unwrap().tiles.iter().map(|t| t.rough).sum::<u32>(), 0);
 }
 
 /// Colors are applied when showing the canvas, not when computing it: the

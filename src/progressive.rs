@@ -403,7 +403,7 @@ impl Scheduler {
             let canvas = self.canvas.as_ref().unwrap();
             let step = self.preview_step(&params).max(PROBE_MIN_STEP);
             let probe = TileBatch::all(canvas.view.width, canvas.view.height, params.max_iter, step, Output::StatsOnly);
-            let stats = renderer.draw(&params, &probe)?;
+            let stats = renderer.draw(&params, &probe)?.total;
             self.record(&stats);
             self.probe_stats.merge(&stats);
             if self.probe_stats.samples >= MIN_DECISION_SAMPLES {
@@ -437,7 +437,7 @@ impl Scheduler {
         let batch = TileBatch::new(jobs, step, Output::Pixels);
         let total = canvas.tiles.len();
 
-        let stats = renderer.draw(&params, &batch)?;
+        let stats = renderer.draw(&params, &batch)?.total;
         self.present(renderer, colors)?;
         self.record(&stats);
         let canvas = self.canvas.as_mut().unwrap();

@@ -6,7 +6,7 @@
 
 use mandelbrot::app::{Colors, Explorer, FrameParams};
 use mandelbrot::progressive::Scheduler;
-use mandelbrot::render::{FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
+use mandelbrot::render::{BatchStats, FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileStats};
 
 /// Every renderer call, in order.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,7 +18,8 @@ pub enum Call {
 }
 
 /// Records calls; reports statistics from `stats` (given the frame and the
-/// batch's sample count), at a fixed GPU cost per sample.
+/// batch's sample count), at a fixed GPU cost per sample. Per-tile stats
+/// only count samples.
 pub struct MockRenderer {
     pub batches: Vec<TileBatch>,
     pub reprojections: Vec<Reprojection>,
@@ -51,15 +52,20 @@ pub fn stats(samples: u64, max_escaped: u32, near_limit: u32, interior: u32) -> 
 impl Renderer for MockRenderer {
     fn resize(&mut self, _: u32, _: u32, _: f64) {}
 
-    fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
+    fn draw(&mut self, p: &FrameParams, batch: &TileBatch) -> Result<BatchStats> {
         self.batches.push(batch.clone());
         self.log.push(match batch.output {
             Output::Pixels => Call::DrawPixels,
             Output::StatsOnly => Call::DrawStats,
         });
-        let samples = batch.tiles.len() as u64 * (TILE / batch.step).pow(2) as u64;
+        let per_side = TILE / batch.step;
+        let samples = batch.tiles.len() as u64 * per_side.pow(2) as u64;
         let s = (self.stats)(p, batch, samples);
-        Ok(FrameStats { gpu_ms: samples as f64 * self.ms_per_sample, samples, ..s })
+        let tile = TileStats { samples: per_side.pow(2), pairs: TileStats::pairs_in(per_side, per_side), ..Default::default() };
+        Ok(BatchStats {
+            total: FrameStats { gpu_ms: samples as f64 * self.ms_per_sample, samples, ..s },
+            tiles: vec![tile; batch.tiles.len()],
+        })
     }
 
     fn reproject(&mut self, xf: &Reprojection) -> Result<()> {

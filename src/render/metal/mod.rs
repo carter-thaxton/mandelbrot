@@ -28,7 +28,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch};
+use super::{BatchStats, FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileStats};
 use crate::app::{Colors, FrameParams};
 use crate::perturb::ReferenceOrbit;
 
@@ -62,14 +62,18 @@ struct GpuColors {
 /// The canvas format: one f32 of smooth iteration count per pixel.
 const CANVAS_FORMAT: MTLPixelFormat = MTLPixelFormat::R32Float;
 
-/// Layout of the kernel's stats buffer (buffer 2); see `FrameStats`.
+/// Layout of one entry of the kernel's per-tile stats buffer (buffer 2),
+/// `TileStats` in the shader; see [`TileStats`].
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct GpuStats {
+struct GpuTileStats {
     max_escaped: u32,
+    escaped_iters: u32,
     near_limit: u32,
     interior: u32,
-    _pad: u32,
+    rough: u32,
+    edge: u32,
+    _pad: [u32; 2],
 }
 
 pub struct MetalRenderer {
@@ -88,8 +92,8 @@ pub struct MetalRenderer {
     reference: Option<(Arc<ReferenceOrbit>, Retained<Buffer>)>,
     /// Bound at buffer(1) when there is no reference, to keep validation happy.
     empty_buffer: Retained<Buffer>,
-    /// Kernel statistics (shared memory, reset before each dispatch).
-    stats: Retained<Buffer>,
+    /// Per-tile kernel statistics (shared memory), grown as batches need.
+    tile_stats: Retained<Buffer>,
 }
 
 impl MetalRenderer {
@@ -102,7 +106,7 @@ impl MetalRenderer {
         let colorize_pipeline = build_pipeline(&device, &library, "colorize")?;
         let layer = window.map(|w| attach_layer(w, &device)).transpose()?;
         let empty_buffer = new_buffer(&device, &[0u8; 64])?;
-        let stats = new_buffer(&device, &[GpuStats::default()])?;
+        let tile_stats = new_buffer(&device, &[GpuTileStats::default(); 64])?;
         Ok(Self {
             device,
             queue,
@@ -114,7 +118,7 @@ impl MetalRenderer {
             spare: None,
             reference: None,
             empty_buffer,
-            stats,
+            tile_stats,
         })
     }
 
@@ -132,24 +136,30 @@ impl MetalRenderer {
         Ok(buffer)
     }
 
-    /// Encode the Mandelbrot kernel for `batch` of `target`; returns samples.
+    /// Encode the Mandelbrot kernel for `batch` of `target`. Returns each
+    /// tile's grid of samples inside the canvas (edge tiles may be partial).
     fn encode(
         &mut self,
         cmd: &CommandBuffer,
         target: &Texture,
         params: &FrameParams,
         batch: &TileBatch,
-    ) -> Result<u64> {
+    ) -> Result<Vec<[u32; 2]>> {
         if batch.tiles.is_empty() {
-            return Ok(0);
+            return Ok(vec![]);
         }
         debug_assert!(batch.tiles.iter().all(|t| t.max_iter <= params.max_iter), "tile limit above the frame's");
-        let gpu = GpuParams::new(params, batch.step, batch.output);
+        let gpu = GpuParams::new(params, batch);
         let per_side = (TILE / gpu.step) as usize;
         let reference = self.reference_buffer(params)?;
-        // SAFETY: the buffer was created with room for one GpuStats, and the
-        // GPU is idle (every command buffer is waited on).
-        unsafe { self.stats.contents().cast::<GpuStats>().write(GpuStats::default()) };
+        let n = batch.tiles.len();
+        if self.tile_stats.length() < n * size_of::<GpuTileStats>() {
+            let len = n.next_power_of_two() * size_of::<GpuTileStats>();
+            self.tile_stats = self
+                .device
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModeShared)
+                .ok_or("failed to allocate Metal buffer")?;
+        }
 
         let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
         enc.setComputePipelineState(&self.pipeline);
@@ -160,8 +170,9 @@ impl MetalRenderer {
         };
         // SAFETY: texture 0 / buffers 0-3 match the kernel signature, setBytes
         // copies its data before returning, the kernel reads at most `ref_len`
-        // reference points and one tile per grid slice, and only writes inside
-        // those tiles of `target`.
+        // reference points and one tile per grid slice, writes one stats
+        // entry per tile (the buffer holds at least n), and only writes
+        // inside those tiles of `target`.
         unsafe {
             enc.setTexture_atIndex(Some(target), 0);
             enc.setBytes_length_atIndex(
@@ -170,7 +181,7 @@ impl MetalRenderer {
                 0,
             );
             enc.setBuffer_offset_atIndex(Some(&reference), 0, 1);
-            enc.setBuffer_offset_atIndex(Some(&self.stats), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&self.tile_stats), 0, 2);
             match &tiles {
                 Some(buffer) => enc.setBuffer_offset_atIndex(Some(buffer), 0, 3),
                 None => enc.setBytes_length_atIndex(
@@ -181,30 +192,30 @@ impl MetalRenderer {
             }
         }
         // One slice of the grid per tile; pack several small slices into a
-        // threadgroup so coarse steps still fill SIMD groups.
-        let n = batch.tiles.len();
+        // threadgroup so coarse steps still fill SIMD groups. A threadgroup
+        // then holds whole tiles: at most 256 threads and 64 tiles, the
+        // shader's MAX_GROUP_THREADS and MAX_GROUP_TILES.
         let depth = (64 / (per_side * per_side)).clamp(1, n);
         enc.dispatchThreads_threadsPerThreadgroup(
             MTLSize { width: per_side, height: per_side, depth: n },
             MTLSize { width: per_side, height: per_side, depth },
         );
         enc.endEncoding();
-        // Samples actually inside the canvas (edge tiles may be partial).
         let step = gpu.step;
-        let samples = batch
+        Ok(batch
             .tiles
             .iter()
             .map(|t| {
                 let w = TILE.min(params.width.saturating_sub(t.origin[0])).div_ceil(step);
                 let h = TILE.min(params.height.saturating_sub(t.origin[1])).div_ceil(step);
-                w as u64 * h as u64
+                [w, h]
             })
-            .sum();
-        Ok(samples)
+            .collect())
     }
 
-    /// Wait for `cmd` and collect timing plus the kernel's statistics.
-    fn finish(&self, cmd: &CommandBuffer, samples: u64) -> Result<FrameStats> {
+    /// Wait for `cmd` and collect timing plus the kernel's statistics for
+    /// tiles with sample grids `grids` (from [`Self::encode`]).
+    fn finish(&self, cmd: &CommandBuffer, grids: &[[u32; 2]]) -> Result<BatchStats> {
         cmd.commit();
         // Each dispatch is kept small by the app's scheduler, so waiting here
         // is cheap and keeps the stats readback trivial.
@@ -212,15 +223,23 @@ impl MetalRenderer {
         if let Some(err) = cmd.error() {
             return Err(format!("GPU error: {}", err.localizedDescription()));
         }
-        // SAFETY: the GPU has finished writing the stats buffer.
-        let s = unsafe { self.stats.contents().cast::<GpuStats>().read() };
-        Ok(FrameStats {
-            gpu_ms: (cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0,
-            samples,
-            max_escaped: s.max_escaped,
-            near_limit: s.near_limit,
-            interior: s.interior,
-        })
+        // SAFETY: the GPU has finished, having written one entry per tile.
+        let gpu = unsafe { std::slice::from_raw_parts(self.tile_stats.contents().cast::<GpuTileStats>().as_ptr(), grids.len()) };
+        let tiles = gpu
+            .iter()
+            .zip(grids)
+            .map(|(s, &[w, h])| TileStats {
+                samples: w * h,
+                max_escaped: s.max_escaped,
+                escaped_iters: s.escaped_iters,
+                near_limit: s.near_limit,
+                interior: s.interior,
+                pairs: TileStats::pairs_in(w, h),
+                rough: s.rough,
+                edge: s.edge,
+            })
+            .collect();
+        Ok(BatchStats::of_tiles((cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0, tiles))
     }
 
     fn new_texture(&self, w: usize, h: usize, format: MTLPixelFormat, shared: bool) -> Result<Retained<Texture>> {
@@ -328,7 +347,7 @@ impl Renderer for MetalRenderer {
         Ok(())
     }
 
-    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats> {
+    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<BatchStats> {
         let canvas = self.canvas.clone().ok_or("draw() before resize()")?;
         // The canvas is only as big as the last resize; never dispatch past it.
         let mut params = params.clone();
@@ -336,8 +355,8 @@ impl Renderer for MetalRenderer {
         params.height = params.height.min(canvas.height() as u32);
 
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
-        let samples = self.encode(&cmd, &canvas, &params, batch)?;
-        self.finish(&cmd, samples)
+        let grids = self.encode(&cmd, &canvas, &params, batch)?;
+        self.finish(&cmd, &grids)
     }
 
     fn present(&mut self, colors: &Colors) -> Result<()> {
@@ -366,8 +385,8 @@ impl Renderer for MetalRenderer {
         let mu = self.new_texture(w, h, CANVAS_FORMAT, false)?;
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
         let batch = TileBatch::all(params.width, params.height, params.max_iter, step, Output::Pixels);
-        let samples = self.encode(&cmd, &mu, params, &batch)?;
-        let stats = self.finish(&cmd, samples)?;
+        let grids = self.encode(&cmd, &mu, params, &batch)?;
+        let stats = self.finish(&cmd, &grids)?.total;
         Ok((self.colorized_rgba(&mu, colors)?, stats))
     }
 }

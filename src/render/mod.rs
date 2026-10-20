@@ -54,6 +54,10 @@ impl TileJob {
     }
 }
 
+/// Default for [`TileBatch::rough_mu`]: about a quarter palette cycle at
+/// color density 1 (a cycle per 50 iterations).
+pub const DEFAULT_ROUGH_MU: f32 = 12.0;
+
 /// Which tiles of the canvas to compute, how coarsely, and what to produce.
 #[derive(Clone, Debug)]
 pub struct TileBatch {
@@ -62,11 +66,14 @@ pub struct TileBatch {
     /// A power of two no larger than [`TILE`].
     pub step: u32,
     pub output: Output,
+    /// Adjacent samples whose smooth iteration counts differ by more than
+    /// this count as rough ([`TileStats::rough`]).
+    pub rough_mu: f32,
 }
 
 impl TileBatch {
     pub fn new(tiles: Vec<TileJob>, step: u32, output: Output) -> Self {
-        Self { tiles, step, output }
+        Self { tiles, step, output, rough_mu: DEFAULT_ROUGH_MU }
     }
 
     /// Every tile of a `width` x `height` canvas, all with limit `max_iter`.
@@ -88,6 +95,58 @@ pub struct Reprojection {
     /// New view center minus old, in old pixels (+y down).
     pub shift: (f64, f64),
     pub old_size: (u32, u32),
+}
+
+/// Measurements for one tile of a draw, at the batch's step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TileStats {
+    /// Samples inside the canvas (edge tiles may be partial).
+    pub samples: u32,
+    /// Highest iteration count among escaped samples.
+    pub max_escaped: u32,
+    /// Sum of the escaped samples' iteration counts. With `interior` times
+    /// the tile's limit, what the tile cost.
+    pub escaped_iters: u32,
+    /// Escaped samples that needed more than 3/4 of the tile's limit.
+    pub near_limit: u32,
+    /// Samples that never escaped.
+    pub interior: u32,
+    /// Horizontally or vertically adjacent sample pairs within the tile.
+    pub pairs: u32,
+    /// Pairs, both escaped, whose smooth iteration counts differ by more
+    /// than [`TileBatch::rough_mu`]: noise rather than detail.
+    pub rough: u32,
+    /// Pairs where exactly one sample escaped (the fringe next to black).
+    pub edge: u32,
+}
+
+impl TileStats {
+    /// Adjacent pairs in a `w` x `h` grid of samples.
+    pub fn pairs_in(w: u32, h: u32) -> u32 {
+        (w.saturating_sub(1) * h) + (w * h.saturating_sub(1))
+    }
+}
+
+/// Measurements from one `draw`: totals, and one entry per tile of the
+/// batch, in the batch's order.
+#[derive(Clone, Debug, Default)]
+pub struct BatchStats {
+    pub total: FrameStats,
+    pub tiles: Vec<TileStats>,
+}
+
+impl BatchStats {
+    /// Totals merged from the tiles.
+    pub fn of_tiles(gpu_ms: f64, tiles: Vec<TileStats>) -> Self {
+        let mut total = FrameStats { gpu_ms, ..Default::default() };
+        for t in &tiles {
+            total.samples += t.samples as u64;
+            total.max_escaped = total.max_escaped.max(t.max_escaped);
+            total.near_limit += t.near_limit;
+            total.interior += t.interior;
+        }
+        Self { total, tiles }
+    }
 }
 
 /// Measurements from one `draw`/`capture`, used for scheduling and for
@@ -123,7 +182,7 @@ pub trait Renderer {
 
     /// Compute `batch` of the canvas (or only its statistics; see [`Output`]).
     /// Nothing appears on screen until [`Renderer::present`].
-    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<FrameStats>;
+    fn draw(&mut self, params: &FrameParams, batch: &TileBatch) -> Result<BatchStats>;
 
     /// Color the canvas and show it in the window (a no-op without one).
     fn present(&mut self, colors: &Colors) -> Result<()>;
@@ -195,6 +254,8 @@ pub struct GpuParams {
     pub sa_n: u32,
     pub sa_a_m: [f32; 2],
     pub sa_a_e: i32,
+    /// See [`TileBatch::rough_mu`].
+    pub rough_mu: f32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -204,7 +265,8 @@ fn split_f64(v: f64) -> [f32; 2] {
 }
 
 impl GpuParams {
-    pub fn new(p: &FrameParams, step: u32, output: Output) -> Self {
+    pub fn new(p: &FrameParams, batch: &TileBatch) -> Self {
+        let step = batch.step;
         let (scale_m, scale_e) = frexp(p.scale);
         let (ref_off_m, ref_off_e) = complex_floatexp(p.ref_offset.0, p.ref_offset.1);
         Self {
@@ -227,7 +289,8 @@ impl GpuParams {
             sa_n: p.series_n,
             sa_a_m: p.series_a.0,
             sa_a_e: p.series_a.1,
-            stats_only: (output == Output::StatsOnly) as u32,
+            rough_mu: batch.rough_mu,
+            stats_only: (batch.output == Output::StatsOnly) as u32,
         }
     }
 }
@@ -265,8 +328,31 @@ mod tests {
         assert_eq!(offset_of!(GpuParams, stats_only), 32);
         assert_eq!(offset_of!(GpuParams, ref_off_m), 56);
         assert_eq!(offset_of!(GpuParams, sa_a_m), 72);
-        // 84 bytes of fields, padded to the shader's 8-byte alignment.
+        assert_eq!(offset_of!(GpuParams, rough_mu), 84);
         assert_eq!(size_of::<GpuParams>(), 88);
+    }
+
+    #[test]
+    fn batch_totals_merge_the_tiles() {
+        let tile = |samples, max_escaped, near_limit, interior| TileStats {
+            samples,
+            max_escaped,
+            near_limit,
+            interior,
+            ..Default::default()
+        };
+        let b = BatchStats::of_tiles(2.5, vec![tile(256, 900, 3, 10), tile(64, 1200, 1, 0), tile(256, 0, 0, 256)]);
+        let t = b.total;
+        assert_eq!((t.gpu_ms, t.samples, t.max_escaped, t.near_limit, t.interior), (2.5, 576, 1200, 4, 266));
+        assert_eq!(b.tiles.len(), 3);
+    }
+
+    #[test]
+    fn adjacent_pairs_in_a_grid() {
+        assert_eq!(TileStats::pairs_in(16, 16), 2 * 15 * 16);
+        assert_eq!(TileStats::pairs_in(3, 2), 7);
+        assert_eq!(TileStats::pairs_in(1, 1), 0);
+        assert_eq!(TileStats::pairs_in(0, 5), 0);
     }
 
     /// `TileJob` is read by the shader as { uint2 origin; uint max_iter; uint _pad; }.

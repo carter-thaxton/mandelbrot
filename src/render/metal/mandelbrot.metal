@@ -30,6 +30,7 @@ struct Params {
     uint   sa_n;       // series approximation: start at iteration sa_n...
     float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
     int    sa_a_e;
+    float  rough_mu;   // neighbors whose mu differ by more than this are rough
 };
 
 // One tile to compute. Must match `TileJob` in src/render/mod.rs.
@@ -44,13 +45,25 @@ constant float INSIDE = -1.0;
 
 constant uint TILE = 16; // must match TILE in src/render/mod.rs
 
-// Must match `GpuStats` in render/metal/mod.rs.
-struct Stats {
-    atomic_uint max_escaped;  // highest iteration count among escaped samples
-    atomic_uint near_limit;   // escaped samples needing > 3/4 of their tile's limit
-    atomic_uint interior;     // samples that never escaped
-    uint        _pad;
+// Statistics for one tile of a batch. Must match `GpuTileStats` in
+// render/metal/mod.rs.
+struct TileStats {
+    uint max_escaped;   // highest iteration count among escaped samples
+    uint escaped_iters; // sum of the escaped samples' iteration counts
+    uint near_limit;    // escaped samples needing > 3/4 of the tile's limit
+    uint interior;      // samples that never escaped
+    uint rough;         // adjacent pairs, both escaped, mu differing > rough_mu
+    uint edge;          // adjacent pairs where exactly one sample escaped
+    uint _pad[2];
 };
+constant uint STAT_COUNT = 6;
+
+// Largest threadgroup: one full-resolution tile (16 x 16), and at most 64
+// tiles per threadgroup at coarser steps (see `encode` in metal/mod.rs).
+constant uint MAX_GROUP_THREADS = 256;
+constant uint MAX_GROUP_TILES = 64;
+/// Shared-memory marker for samples outside the canvas.
+constant float NO_SAMPLE = -2.0;
 
 constant float BAILOUT2 = 65536.0; // |z| > 256: large radius for smooth coloring
 
@@ -378,9 +391,11 @@ float3 palette(uint which, float t) {
 kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        constant Params& p                 [[buffer(0)]],
                        device const RefPoint* ref         [[buffer(1)]],
-                       device Stats& stats                [[buffer(2)]],
+                       device TileStats* tile_stats       [[buffer(2)]],
                        device const TileJob* tiles        [[buffer(3)]],
-                       uint3 gid                          [[thread_position_in_grid]])
+                       uint3 gid                          [[thread_position_in_grid]],
+                       uint3 lid                          [[thread_position_in_threadgroup]],
+                       uint simd_width                    [[threads_per_simdgroup]])
 {
     // Grid: (TILE/step, TILE/step, tile count). Each thread computes one
     // sample at the center of a step x step block within its tile.
@@ -431,17 +446,63 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         }
     }
 
-    // Statistics for automatic iteration limits: reduce across the SIMD group
-    // first so only one thread per group touches the atomics.
+    // Per-tile statistics. A threadgroup holds whole tiles (slice lid.z is
+    // one tile), so neighbors are exchanged through threadgroup memory and
+    // each tile is reduced on its own.
+    uint per_side = TILE / p.step;
+    uint flat = (lid.z * per_side + lid.y) * per_side + lid.x;
+    threadgroup float shared_mu[MAX_GROUP_THREADS];
+    threadgroup atomic_uint acc[MAX_GROUP_TILES * STAT_COUNT];
+    threadgroup atomic_uint* mine = &acc[lid.z * STAT_COUNT];
+    bool leader = lid.x == 0 && lid.y == 0;
+    shared_mu[flat] = valid ? mu : NO_SAMPLE;
+    if (leader) {
+        for (uint k = 0; k < STAT_COUNT; ++k) atomic_store_explicit(&mine[k], 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     bool escaped = valid && mu >= 0.0;
     uint n = escaped ? uint(mu) : 0;
-    uint group_max = simd_max(n);
-    uint group_near = simd_sum(uint(escaped && n > max_iter / 4 * 3));
-    uint group_interior = simd_sum(uint(valid && !escaped));
-    if (simd_is_first()) {
-        atomic_fetch_max_explicit(&stats.max_escaped, group_max, memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats.near_limit, group_near, memory_order_relaxed);
-        atomic_fetch_add_explicit(&stats.interior, group_interior, memory_order_relaxed);
+    uint rough = 0, edge = 0;
+    if (valid) {
+        // Right and lower neighbors within the tile.
+        float right = lid.x + 1 < per_side ? shared_mu[flat + 1] : NO_SAMPLE;
+        float below = lid.y + 1 < per_side ? shared_mu[flat + per_side] : NO_SAMPLE;
+        for (uint k = 0; k < 2; ++k) {
+            float other = k == 0 ? right : below;
+            if (other == NO_SAMPLE) continue;
+            bool other_escaped = other >= 0.0;
+            if (escaped && other_escaped) rough += uint(abs(mu - other) > p.rough_mu);
+            else edge += uint(escaped != other_escaped);
+        }
+    }
+    uint v[STAT_COUNT] = { n, n, uint(escaped && n > max_iter / 4 * 3), uint(valid && !escaped), rough, edge };
+    if (per_side * per_side % simd_width == 0) {
+        // Each SIMD group lies within one tile: reduce it first so only one
+        // thread per group touches the atomics.
+        v[0] = simd_max(v[0]);
+        for (uint k = 1; k < STAT_COUNT; ++k) v[k] = simd_sum(v[k]);
+        if (simd_is_first()) {
+            atomic_fetch_max_explicit(&mine[0], v[0], memory_order_relaxed);
+            for (uint k = 1; k < STAT_COUNT; ++k) atomic_fetch_add_explicit(&mine[k], v[k], memory_order_relaxed);
+        }
+    } else {
+        // Small tiles (coarse steps) share SIMD groups: few samples, so
+        // per-thread atomics are cheap.
+        atomic_fetch_max_explicit(&mine[0], v[0], memory_order_relaxed);
+        for (uint k = 1; k < STAT_COUNT; ++k) {
+            if (v[k] != 0) atomic_fetch_add_explicit(&mine[k], v[k], memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (leader) {
+        device TileStats& out_stats = tile_stats[gid.z];
+        out_stats.max_escaped = atomic_load_explicit(&mine[0], memory_order_relaxed);
+        out_stats.escaped_iters = atomic_load_explicit(&mine[1], memory_order_relaxed);
+        out_stats.near_limit = atomic_load_explicit(&mine[2], memory_order_relaxed);
+        out_stats.interior = atomic_load_explicit(&mine[3], memory_order_relaxed);
+        out_stats.rough = atomic_load_explicit(&mine[4], memory_order_relaxed);
+        out_stats.edge = atomic_load_explicit(&mine[5], memory_order_relaxed);
     }
 }
 
