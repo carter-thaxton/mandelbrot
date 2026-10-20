@@ -109,7 +109,7 @@ pub const MAX_ITER: u32 = 200_000;
 
 /// Initial color cycling speed, in palette cycles per second: slow enough to
 /// read as drifting rather than flashing.
-pub const DEFAULT_COLOR_SPEED: f32 = 0.05;
+pub const DEFAULT_COLOR_SPEED: f32 = 0.1;
 
 /// Every palette repeats after this many cycles, so the color offset can wrap
 /// here seamlessly. (Not 1: Fire's channel frequencies are 1, 0.7 and 0.4,
@@ -199,7 +199,8 @@ impl Explorer {
             palette: 0,
             color_density: 1.0,
             color_offset: 0.0,
-            color_cycling: false,
+            // On by default: it only re-colors already computed values.
+            color_cycling: true,
             color_speed: DEFAULT_COLOR_SPEED,
             iter_limit: MIN_ITER,
             auto_iter: true,
@@ -719,6 +720,8 @@ mod tests {
     #[test]
     fn color_cycling_advances_only_when_on_and_wraps() {
         let mut e = Explorer::new(800, 600);
+        assert!(e.color_cycling, "on by default");
+        e.color_cycling = false;
         e.advance_colors(10.0);
         assert_eq!(e.color_offset, 0.0, "moved while off");
         e.color_cycling = true;

@@ -47,12 +47,18 @@ pub const APEX_SPEED_FRACTION: f64 = 0.25;
 pub const APEX_EASE_DECADES: f64 = 1.5;
 
 /// Initial cruising speed, zoom decades per second.
-pub const DEFAULT_SPEED: f64 = 1.5;
+pub const DEFAULT_SPEED: f64 = 0.7;
+/// Slowest and fastest cruising speeds the speed keys allow.
+pub const MIN_SPEED: f64 = 0.01;
+pub const MAX_SPEED: f64 = 100.0;
 
 // Mechanics.
 
-/// Seconds to reach cruising speed, and roughly to stop from it.
+/// Seconds to reach cruising speed (at the start, and when resuming), and
+/// roughly to stop from it on arrival.
 const RAMP_SECONDS: f64 = 0.5;
+/// Seconds to come to a halt when paused.
+const BRAKE_SECONDS: f64 = 0.2;
 /// Never advance more than this per frame (after a stall, catch up gently).
 const MAX_STEP_SECONDS: f64 = 0.1;
 /// Below this fraction of cruising speed the ramps don't slow down further,
@@ -109,9 +115,9 @@ pub struct Flight {
     /// Total path length, and how far along it we are.
     length: f64,
     travelled: f64,
-    /// Seconds since the flight started moving (or last resumed): drives the
-    /// start ramp.
-    elapsed: f64,
+    /// Multiplies the speed, 0 to 1: rises over RAMP_SECONDS when moving off
+    /// (start, resume) and falls over BRAKE_SECONDS when paused.
+    throttle: f64,
     paused: bool,
     /// ln of the widest view along the path, and of the current view.
     ln_w_apex: f64,
@@ -162,7 +168,7 @@ impl Flight {
             shape,
             length,
             travelled: 0.0,
-            elapsed: 0.0,
+            throttle: 0.0,
             paused: false,
             ln_w_apex,
             ln_w: ln_w0,
@@ -181,49 +187,55 @@ impl Flight {
         self.length / self.cruise()
     }
 
-    /// Path speed right now: cruising, limited by the start and arrival
-    /// ramps and by gravity near the widest view.
+    /// Path speed right now, before the throttle: cruising, limited by the
+    /// arrival ramp and by gravity near the widest view.
     fn current_speed(&self) -> f64 {
         let cruise = self.cruise();
-        // Speed up over RAMP_SECONDS; slow down so a constant deceleration
-        // (cruise / RAMP_SECONDS) would stop exactly at the destination.
-        let ramp_up = cruise * (self.elapsed / RAMP_SECONDS);
+        // Slow down so a constant deceleration (cruise / RAMP_SECONDS) would
+        // stop exactly at the destination.
         let ramp_down = (2.0 * cruise / RAMP_SECONDS * (self.length - self.travelled)).max(0.0).sqrt();
         // Gravity: speed² = top² + 2·g·depth, reaching cruise at APEX_EASE_DECADES.
         let top = cruise * APEX_SPEED_FRACTION;
         let g = (cruise * cruise - top * top) / (2.0 * APEX_EASE_DECADES);
         let depth = ((self.ln_w_apex - self.ln_w) / LN_10).max(0.0);
         let gravity = (top * top + 2.0 * g * depth).sqrt();
-        ramp_up.min(ramp_down).min(gravity).min(cruise).max(cruise * MIN_SPEED_FRACTION)
+        ramp_down.min(gravity).min(cruise).max(cruise * MIN_SPEED_FRACTION)
     }
 
-    /// Stop where it is; [`Flight::advance`] then holds still.
+    /// Come to a halt over BRAKE_SECONDS; [`Flight::advance`] then holds still.
     pub fn pause(&mut self) {
         self.paused = true;
     }
 
-    /// Continue, speeding up from rest as at the start.
+    /// Continue, speeding up again as at the start.
     pub fn resume(&mut self) {
-        if self.paused {
-            self.paused = false;
-            self.elapsed = 0.0;
-        }
+        self.paused = false;
     }
 
+    /// Whether a pause was asked for (the flight may still be braking).
     pub fn is_paused(&self) -> bool {
         self.paused
     }
 
-    /// Advance by `dt` seconds of wall-clock time (none while paused);
-    /// returns the place to show and whether the flight has arrived.
+    /// Whether the flight is paused and has come to rest.
+    pub fn is_stopped(&self) -> bool {
+        self.paused && self.throttle == 0.0
+    }
+
+    /// Advance by `dt` seconds of wall-clock time; returns the place to show
+    /// and whether the flight has arrived.
     pub fn advance(&mut self, dt: f64) -> (Place, bool) {
-        if self.paused {
+        if self.is_stopped() {
             let place = if self.travelled == 0.0 { self.from.clone() } else { self.at(self.travelled).0 };
             return (place, false);
         }
         let dt = dt.clamp(0.0, MAX_STEP_SECONDS);
-        self.elapsed += dt;
-        self.travelled += self.current_speed() * dt;
+        self.throttle = if self.paused {
+            (self.throttle - dt / BRAKE_SECONDS).max(0.0)
+        } else {
+            (self.throttle + dt / RAMP_SECONDS).min(1.0)
+        };
+        self.travelled += self.current_speed() * self.throttle * dt;
         if self.travelled >= self.length {
             self.travelled = self.length;
             self.ln_w = self.to.span.ln();
@@ -429,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_holds_still_and_resume_speeds_up_from_rest() {
+    fn pause_brakes_to_a_halt_and_resume_speeds_up_from_rest() {
         let from = place("-0.75", "0", 2.6);
         let to = place("0", "1", 1e-30);
         let mut f = Flight::new(from.clone(), to.clone(), 2.0);
@@ -438,12 +450,25 @@ mod tests {
             path.push(f.advance(1.0 / 60.0).0);
         }
         f.pause();
-        assert!(f.is_paused());
+        assert!(f.is_paused() && !f.is_stopped());
+        // Braking: each frame moves less than the one before, and the flight
+        // stops after about BRAKE_SECONDS.
+        let mut steps = vec![];
+        while !f.is_stopped() {
+            let before = f.travelled;
+            path.push(f.advance(1.0 / 60.0).0);
+            steps.push(f.travelled - before);
+            assert!(steps.len() < 100, "never stopped");
+        }
+        assert!(steps.windows(2).all(|w| w[1] < w[0]), "not slowing: {steps:?}");
+        let braking = steps.len() as f64 / 60.0;
+        assert!((braking - BRAKE_SECONDS).abs() <= 1.0 / 60.0, "braked for {braking} s");
+        // Then it holds still.
         let held = f.travelled;
         for _ in 0..100 {
             let (p, done) = f.advance(1.0 / 60.0);
             assert!(!done);
-            assert_eq!(&p, path.last().unwrap(), "moved while paused");
+            assert_eq!(&p, path.last().unwrap(), "moved while stopped");
         }
         assert_eq!(f.travelled, held);
 

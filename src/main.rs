@@ -5,7 +5,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use mandelbrot::app::{self, Explorer, Precision, PrecisionMode};
 use mandelbrot::bookmarks::{Bookmarks, HOME};
@@ -29,12 +29,13 @@ Mandelbrot explorer
   [ / ]                      fewer / more iterations (switches to manual)
   a                          automatic iteration limit on / off
   , / .                      color density down / up
-  o                          color cycling on / off
+  o                          color cycling on / off (starts on)
   { / }                      color cycling slower / faster
   ; / '                      shift colors back / forward
   p / shift+p                next / previous palette
   m                          precision: auto -> f32 -> df64 -> perturb
   r                          reset view
+  f                          fullscreen on / off
   s                          save screenshot (PNG in current dir)
   c                          print location (full precision) as a --capture command
   q / cmd+w / cmd+q          quit
@@ -54,6 +55,8 @@ struct App {
     flight_speed: f64,
     /// When color cycling last advanced (None: restart timing).
     last_color_tick: Option<Instant>,
+    /// The window title last set (setting it every frame isn't free).
+    title: String,
 }
 
 struct ActiveFlight {
@@ -81,6 +84,7 @@ impl App {
             flight: None,
             flight_speed: flight::DEFAULT_SPEED,
             last_color_tick: None,
+            title: String::new(),
         }
     }
 
@@ -124,7 +128,7 @@ impl App {
     }
 
     fn set_flight_speed(&mut self, factor: f64) {
-        self.flight_speed = (self.flight_speed * factor).clamp(0.1, 100.0);
+        self.flight_speed = (self.flight_speed * factor).clamp(flight::MIN_SPEED, flight::MAX_SPEED);
         match &mut self.flight {
             Some(active) => active.flight.speed = self.flight_speed,
             None => println!("flight speed {:.2} decades/s", self.flight_speed),
@@ -150,11 +154,11 @@ impl App {
         let e = &mut self.explorer;
         match key {
             Key::Named(NamedKey::Space) => match &mut self.flight {
-                Some(active) if active.flight.is_paused() => active.flight.resume(),
-                Some(active) => {
-                    active.flight.pause();
-                    active.last_tick = None; // so resuming doesn't count the pause as elapsed
+                Some(active) if active.flight.is_paused() => {
+                    active.flight.resume();
+                    active.last_tick = None; // so the time spent stopped doesn't count
                 }
+                Some(active) => active.flight.pause(), // brakes to a halt
                 None => return,
             },
             // Esc only ever stops a flight (quitting is q / cmd+w / cmd+q).
@@ -196,6 +200,14 @@ impl App {
                 ";" => e.shift_colors(-1.0 / 32.0),
                 "'" => e.shift_colors(1.0 / 32.0),
                 "s" | "S" => self.save_screenshot(),
+                "f" | "F" => {
+                    // Like the green window button: native fullscreen on macOS.
+                    if let Some(w) = &self.window {
+                        let full = w.fullscreen().is_some();
+                        w.set_fullscreen((!full).then_some(Fullscreen::Borderless(None)));
+                    }
+                    return; // the resize that follows redraws
+                }
                 "c" | "C" => {
                     let (x, y) = e.center_strings();
                     println!("--center {x},{y} --zoom {:.6e}", e.zoom());
@@ -315,7 +327,7 @@ impl ApplicationHandler for App {
                     self.explorer.advance_colors(dt.min(0.1));
                 }
                 // A flight moves the view by however much time has passed.
-                if let Some(active) = self.flight.as_mut().filter(|a| !a.flight.is_paused()) {
+                if let Some(active) = self.flight.as_mut().filter(|a| !a.flight.is_stopped()) {
                     let now = Instant::now();
                     let dt = active.last_tick.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
                     active.last_tick = Some(now);
@@ -334,7 +346,7 @@ impl ApplicationHandler for App {
                         false
                     }
                 };
-                let flying = self.flight.as_ref().is_some_and(|a| !a.flight.is_paused());
+                let flying = self.flight.as_ref().is_some_and(|a| !a.flight.is_stopped());
                 if more || flying || self.explorer.color_cycling {
                     self.request_redraw();
                 }
@@ -352,7 +364,10 @@ impl ApplicationHandler for App {
                             format!("  |  flying to {dest} at {:.2} decades/s", active.flight.speed)
                         };
                     }
-                    w.set_title(&title);
+                    if title != self.title {
+                        w.set_title(&title);
+                        self.title = title;
+                    }
                 }
             }
 
