@@ -32,9 +32,10 @@
 
 use std::time::{Duration, Instant};
 
-use crate::app::{Colors, Explorer, FrameParams, MAX_ITER, Place};
+use crate::app::{Colors, Explorer, FrameParams, Place};
 use crate::bookmarks::PRESETS;
 use crate::flight::Flight;
+use crate::policy::{MAX_ITER, Policy};
 use crate::progressive::Scheduler;
 use crate::render::{BatchStats, FrameStats, Output, Renderer, Reprojection, Result, TileBatch};
 
@@ -154,6 +155,8 @@ pub struct Config {
     /// While moving, measure truncation every this many frames (0: never;
     /// it's always measured once settled).
     pub truncation_every: usize,
+    /// The policy under test.
+    pub policy: fn() -> Policy,
 }
 
 impl Config {
@@ -167,6 +170,7 @@ impl Config {
             metrics: true,
             error_every: 12,
             truncation_every: 60,
+            policy: Policy::master,
         }
     }
 
@@ -180,6 +184,7 @@ impl Config {
             metrics: false,
             error_every: 0,
             truncation_every: 0,
+            policy: Policy::master,
         }
     }
 }
@@ -543,7 +548,7 @@ pub fn run(scenario: &Scenario, cfg: &Config, renderer: &mut dyn Renderer) -> Re
     let mut p = Player {
         cfg,
         e,
-        s: Scheduler::default(),
+        s: Scheduler::with_policy((cfg.policy)()),
         rec: Recorder {
             inner: renderer,
             model_cost: cfg.deterministic.then_some(MODEL_MS_PER_SAMPLE_ITER),

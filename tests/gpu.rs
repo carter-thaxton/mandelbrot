@@ -338,7 +338,7 @@ fn simulated_deep_zoom() {
     let mut e = Explorer::new(w, h);
     e.set_center_str(SEAHORSE.0, SEAHORSE.1);
     e.zoom_at_center(1e10);
-    e.iter_limit = e.estimate_iter();
+    e.reset_iter_estimate();
     let mut s = Scheduler::default();
     let start = std::time::Instant::now();
     let mut next_report = 10.0;
@@ -355,5 +355,5 @@ fn simulated_deep_zoom() {
     let settle = std::time::Instant::now();
     while s.step(&mut e, r.as_mut()).unwrap() {}
     println!("settled at 1e30: iters {} after {:.1} s", e.iter_limit, settle.elapsed().as_secs_f64());
-    println!("{}", e.hud(None, None));
+    println!("{}", e.hud(&s.policy().describe(), None, None));
 }

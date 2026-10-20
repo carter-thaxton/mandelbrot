@@ -10,6 +10,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use mandelbrot::app::{self, Explorer, Precision, PrecisionMode};
 use mandelbrot::bookmarks::{Bookmarks, HOME};
 use mandelbrot::flight::{self, Flight};
+use mandelbrot::policy::{MIN_DECISION_SAMPLES, Policy};
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Renderer};
 
@@ -178,9 +179,9 @@ impl App {
                 "-" => e.zoom_at_center(0.5),
                 "+" => return self.set_flight_speed(1.5),
                 "_" => return self.set_flight_speed(1.0 / 1.5),
-                "[" => e.scale_iter_limit(1.0 / 1.5),
-                "]" => e.scale_iter_limit(1.5),
-                "a" | "A" => e.auto_iter = !e.auto_iter,
+                "[" => e.scale_detail(1.0 / 1.5),
+                "]" => e.scale_detail(1.5),
+                "a" | "A" => e.toggle_auto_iter(),
                 "," | "<" => e.color_density /= 1.25,
                 "." | ">" => e.color_density *= 1.25,
                 "p" => e.cycle_palette(true),
@@ -351,7 +352,8 @@ impl ApplicationHandler for App {
                     self.request_redraw();
                 }
                 if let Some(w) = &self.window {
-                    let mut title = self.explorer.hud(Some(self.scheduler.work_ms()), self.scheduler.progress());
+                    let iters = self.scheduler.policy().describe();
+                    let mut title = self.explorer.hud(&iters, Some(self.scheduler.work_ms()), self.scheduler.progress());
                     if let Some(active) = &self.flight {
                         let dest = match (active.slot, self.bookmarks.name(active.slot)) {
                             (HOME, _) => "home".to_string(),
@@ -436,10 +438,15 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     explorer.zoom_at_center(zoom);
     explorer.color_density = density;
     explorer.series_skip = series_skip;
-    explorer.iter_limit = explorer.estimate_iter();
+    explorer.reset_iter_estimate();
     if let Some(n) = iters {
         explorer.set_iter_limit(n);
     }
+    let mut policy = Policy::master();
+    for event in explorer.take_inputs() {
+        policy.input(event);
+    }
+    explorer.iter_limit = policy.ceiling();
 
     let mut renderer = render::create_headless()?;
     let start = std::time::Instant::now();
@@ -447,22 +454,23 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     // interactive preview does: as coarse as possible while still giving
     // enough samples to decide on (small images need a finer step).
     let pixels = w as f64 * h as f64;
-    let settle_step = (1..=4).rev().find(|s| pixels / (s * s) as f64 >= app::MIN_DECISION_SAMPLES as f64).unwrap_or(1);
+    let settle_step = (1..=4).rev().find(|s| pixels / (s * s) as f64 >= MIN_DECISION_SAMPLES as f64).unwrap_or(1);
     for _ in 0..8 {
         let (_, stats) = renderer.capture(&explorer.frame_params(), settle_step, &explorer.colors())?;
         if std::env::var_os("MANDEL_DEBUG_ITERS").is_some() {
             eprintln!("settle: limit {} -> {stats:?}", explorer.iter_limit);
         }
-        if !explorer.observe(&stats, true) {
+        if !policy.judge(&stats) {
             break;
         }
+        explorer.iter_limit = policy.ceiling();
     }
     let settle_ms = start.elapsed().as_secs_f64() * 1000.0;
     let params = explorer.frame_params();
     let (pixels, stats) = renderer.capture(&params, 1, &explorer.colors())?;
     println!(
         "{}  (settle {settle_ms:.0} ms, gpu {:.1} ms, total {:.1} ms)",
-        explorer.hud(None, None),
+        explorer.hud(&policy.describe(), None, None),
         stats.gpu_ms,
         start.elapsed().as_secs_f64() * 1000.0
     );

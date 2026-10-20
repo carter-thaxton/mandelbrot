@@ -1,8 +1,8 @@
 //! The progressive scheduler driving an `Explorer`, against a mock renderer.
 //!
 //! These check how the two cooperate: which tiles get computed and when,
-//! what reaches the screen, and how GPU statistics steer the explorer's
-//! automatic iteration limit. No GPU needed.
+//! what reaches the screen, and how GPU statistics steer the (master)
+//! policy's automatic iteration limit. No GPU needed.
 
 mod common;
 
@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use common::{Call, MockRenderer, run_to_completion, stats};
 use mandelbrot::app::Explorer;
+use mandelbrot::policy::Policy;
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{Output, TILE};
 
@@ -161,7 +162,7 @@ fn limit_adapts_during_continuous_motion() {
         }
     });
     let mut e = Explorer::new(400, 304);
-    let mut s = Scheduler::with_probe_interval(Duration::ZERO);
+    let mut s = Scheduler::with_policy(Policy::master().with_probe_interval(Duration::ZERO));
     let start = e.iter_limit;
     // Pan a little every frame: no sweep ever completes, so only probes can
     // move the limit.

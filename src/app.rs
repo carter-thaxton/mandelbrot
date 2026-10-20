@@ -1,5 +1,6 @@
-//! Platform-independent explorer state: navigation, iteration policy, colors,
-//! and the perturbation reference orbit's lifecycle.
+//! Platform-independent explorer state: navigation, colors, and the
+//! perturbation reference orbit's lifecycle. Input that affects iteration
+//! depth is queued for the policy (see `policy.rs`).
 //!
 //! Nothing in here knows about Metal, AppKit, or even winit. Input is fed in as
 //! plain numbers (physical pixels), and the output is a [`FrameParams`] that any
@@ -10,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 use crate::bigfixed::{Fixed, frac_limbs_for_scale};
 use crate::perturb::{ReferenceOrbit, compute_reference};
-use crate::render::FrameStats;
+use crate::policy::{Input, MAX_ITER, MIN_ITER, estimate_iter};
 
 /// Which arithmetic the GPU kernel should use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,12 +102,6 @@ const MIN_SCALE: f64 = 1e-300;
 /// Switch away from plain f32 once a pixel is smaller than this (Auto mode).
 const F32_LIMIT: f64 = 2e-6;
 
-pub const MIN_ITER: u32 = 256;
-/// Automatic iteration decisions need at least this many samples: the 0.1%
-/// cut-off test is meaningless on a few thousand (it fired on 8 pixels).
-pub const MIN_DECISION_SAMPLES: u64 = 20_000;
-pub const MAX_ITER: u32 = 200_000;
-
 /// Initial color cycling speed, in palette cycles per second: slow enough to
 /// read as drifting rather than flashing.
 pub const DEFAULT_COLOR_SPEED: f32 = 0.1;
@@ -116,19 +111,6 @@ pub const DEFAULT_COLOR_SPEED: f32 = 0.1;
 /// which only all complete whole waves after 10 cycles. Palettes in the
 /// shader must keep frequency × 10 whole.)
 pub const PALETTE_PERIOD: f32 = 10.0;
-
-/// In auto mode, each zoom by a factor f scales the iteration limit by
-/// f^ITERS_PER_ZOOM, so it keeps roughly in step while zooming; GPU
-/// statistics then correct it for the actual location. Fitted to the seahorse
-/// valley (5.4k needed at 1e10, 62k at 1e30); flatter places just get
-/// corrected down.
-const ITERS_PER_ZOOM: f64 = 0.04;
-/// Most the predictor may raise the limit in one view change. A sudden deep
-/// jump would otherwise multiply it by thousands (straight to MAX_ITER), and
-/// from above it can get stuck: around a minibrot a few pixels always escape
-/// very late, so the shrink rule never fires. From below, the statistics
-/// double it cheaply until it's enough, then stop.
-const MAX_PREDICTED_GROWTH: f64 = 2.0;
 
 /// A reference may be used while within this many view sizes of the center;
 /// beyond it, f32 deltas lose too much precision and we recompute in place.
@@ -168,18 +150,19 @@ pub struct Explorer {
     pub color_cycling: bool,
     /// Cycling speed, palette cycles per second.
     pub color_speed: f32,
+    /// The iteration limit frames are computed for: the reference orbit and
+    /// series skip cover it. Set by the scheduler from its policy (see
+    /// `policy.rs`), or directly when rendering without one.
     pub iter_limit: u32,
-    /// Adjust `iter_limit` from GPU statistics (see [`Explorer::observe`]).
-    pub auto_iter: bool,
     /// Use the series approximation to skip early iterations (Perturbation).
     pub series_skip: bool,
     /// Compute better-centered reference orbits on a background thread
     /// (false: synchronously, adopted on the next frame as if the thread had
     /// just finished, which makes runs reproducible).
     pub background_references: bool,
-    /// Zoom-driven change to `iter_limit` not yet applied (applied in >=5%
-    /// steps so continuous zooming doesn't change it every frame).
-    iter_drift: f64,
+    /// Input that affects iteration depth, for the policy (see
+    /// [`Explorer::take_inputs`]).
+    inputs: Vec<Input>,
     drag_anchor: Option<(f64, f64)>,
     pub cursor: (f64, f64),
     /// Sub-pixel pan not yet applied: pans move the center in whole pixels so
@@ -207,10 +190,9 @@ impl Explorer {
             color_cycling: true,
             color_speed: DEFAULT_COLOR_SPEED,
             iter_limit: MIN_ITER,
-            auto_iter: true,
             series_skip: true,
             background_references: true,
-            iter_drift: 1.0,
+            inputs: vec![],
             drag_anchor: None,
             cursor: (0.0, 0.0),
             pan_remainder: (0.0, 0.0),
@@ -230,8 +212,18 @@ impl Explorer {
         self.scale = self.home_scale();
         let frac = frac_limbs_for_scale(self.scale);
         self.center = (Fixed::from_f64(HOME_CENTER.0, frac), Fixed::from_f64(HOME_CENTER.1, frac));
-        self.auto_iter = true;
-        self.iter_limit = self.estimate_iter();
+        self.reset_iter_estimate();
+    }
+
+    /// Automatic iterations, starting from the estimate for the current depth.
+    pub fn reset_iter_estimate(&mut self) {
+        self.iter_limit = estimate_iter(self.zoom());
+        self.inputs.push(Input::Reset { zoom: self.zoom() });
+    }
+
+    /// Input for the policy since the last call, in order.
+    pub fn take_inputs(&mut self) -> Vec<Input> {
+        std::mem::take(&mut self.inputs)
     }
 
     /// The current view as a window-size-independent [`Place`].
@@ -249,8 +241,7 @@ impl Explorer {
     }
 
     /// Show `place`. Only the view changes (not colors or iteration mode);
-    /// in auto mode the iteration limit follows the depth change, as when
-    /// zooming.
+    /// the policy sees the depth change as a zoom.
     pub fn go_to(&mut self, place: &Place) {
         let new_scale = (place.span / self.height as f64).clamp(MIN_SCALE, self.home_scale() * 4.0);
         let zoom_factor = self.scale / new_scale;
@@ -261,22 +252,7 @@ impl Explorer {
             place.center.1.with_frac_limbs(frac(&place.center.1)),
         );
         self.pan_remainder = (0.0, 0.0);
-        self.track_depth(zoom_factor);
-    }
-
-    /// In auto mode, scale the iteration limit with a zoom by `factor` (> 1
-    /// zooms in), in >= 5% steps. Growth is capped per call
-    /// (MAX_PREDICTED_GROWTH); shrinking isn't, since it's cheap and the
-    /// statistics raise it again if needed.
-    fn track_depth(&mut self, factor: f64) {
-        if self.auto_iter {
-            self.iter_drift *= factor.powf(ITERS_PER_ZOOM).min(MAX_PREDICTED_GROWTH);
-            if !(1.0 / 1.05..=1.05).contains(&self.iter_drift) {
-                let n = self.iter_limit as f64 * self.iter_drift;
-                self.iter_limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
-                self.iter_drift = 1.0;
-            }
-        }
+        self.inputs.push(Input::Zoom(zoom_factor));
     }
 
     /// Set the center from decimal strings (arbitrary precision).
@@ -316,59 +292,19 @@ impl Explorer {
         };
     }
 
-    /// Starting guess for the iteration limit at the current depth (auto mode
-    /// then corrects it from what the GPU actually sees).
-    pub fn estimate_iter(&self) -> u32 {
-        let decades = self.zoom().max(1.0).log10();
-        (200.0 + 250.0 * decades).clamp(MIN_ITER as f64, 20_000.0) as u32
+    /// The detail keys: scale the iteration limit (turns automatic off).
+    pub fn scale_detail(&mut self, factor: f64) {
+        self.inputs.push(Input::ScaleDetail(factor));
     }
 
-    /// Manually scale the iteration limit (turns auto off).
-    pub fn scale_iter_limit(&mut self, factor: f64) {
-        self.auto_iter = false;
-        self.iter_limit = (self.iter_limit as f64 * factor).clamp(32.0, MAX_ITER as f64) as u32;
+    pub fn toggle_auto_iter(&mut self) {
+        self.inputs.push(Input::ToggleAuto);
     }
 
+    /// A fixed iteration limit (turns automatic off), effective at once.
     pub fn set_iter_limit(&mut self, n: u32) {
-        self.auto_iter = false;
         self.iter_limit = n.clamp(32, MAX_ITER);
-    }
-
-    /// Automatic iteration limit, driven by GPU statistics from a frame drawn
-    /// with the current limit. Returns true if the limit changed.
-    ///
-    /// - More than 0.1% of the *escaped* samples landing in the top quarter
-    ///   of the range means the escape-count tail runs past the limit, cutting
-    ///   off real detail (those pixels would otherwise go black): double it.
-    ///   Measured on real views, this lands within one doubling of the point
-    ///   where the next doubling changes < 0.01% of pixels. (A wider window,
-    ///   the top half, overshoots 2x when escape counts cluster just below the
-    ///   limit. Counting against all samples instead of escaped ones stalls
-    ///   when most of the view is still black.)
-    /// - If even the slowest escaping sample used less than a third of the
-    ///   limit, the extra iterations only cost time on interior pixels: shrink
-    ///   to 2x that sample. That leaves the top quarter empty, so the two
-    ///   rules don't oscillate. Only applied when `whole_view` (a strip
-    ///   revealed by panning says nothing about the rest of the image).
-    pub fn observe(&mut self, s: &FrameStats, whole_view: bool) -> bool {
-        if !self.auto_iter || s.samples < MIN_DECISION_SAMPLES {
-            return false;
-        }
-        let l = self.iter_limit;
-        let escaped = s.samples.saturating_sub(s.interior as u64);
-        let cut_off = s.near_limit >= 4 && s.near_limit as f64 > escaped as f64 * 1e-3;
-        let all_black = s.max_escaped == 0 && s.interior > 0;
-        let new = if cut_off || all_black {
-            l.saturating_mul(2)
-        } else if whole_view && s.max_escaped < l / 3 {
-            s.max_escaped.saturating_mul(2)
-        } else {
-            l
-        }
-        .clamp(MIN_ITER, MAX_ITER);
-        let changed = new != l;
-        self.iter_limit = new;
-        changed
+        self.inputs.push(Input::SetLimit(n));
     }
 
     /// Move the center by a complex-plane offset, growing precision as needed.
@@ -389,7 +325,7 @@ impl Explorer {
         let k = new_scale / self.scale;
         self.scale = new_scale;
         self.pan_remainder = (0.0, 0.0);
-        self.track_depth(k.recip());
+        self.inputs.push(Input::Zoom(k.recip()));
         self.shift_center(ox * (1.0 - k), oy * (1.0 - k));
     }
 
@@ -567,8 +503,10 @@ impl Explorer {
         (self.center.0.to_decimal(digits), self.center.1.to_decimal(digits))
     }
 
-    /// Window title. `progress` is the refinement fraction (None when done).
-    pub fn hud(&self, gpu_ms: Option<f64>, progress: Option<f32>) -> String {
+    /// Window title. `iters` describes the iteration policy (see
+    /// `Policy::describe`); `progress` is the refinement fraction (None when
+    /// done).
+    pub fn hud(&self, iters: &str, gpu_ms: Option<f64>, progress: Option<f32>) -> String {
         let mode = match (self.precision_mode, self.precision()) {
             (PrecisionMode::Auto, Precision::F32) => "auto/f32",
             (PrecisionMode::Auto, Precision::DoubleFloat) => "auto/df64",
@@ -590,7 +528,6 @@ impl Explorer {
             ),
             _ => String::new(),
         };
-        let iters = format!("iters {} {}", self.iter_limit, if self.auto_iter { "auto" } else { "manual" });
         let status = match (progress, gpu_ms) {
             (Some(p), _) => format!("  |  refining {:.0}%", p * 100.0),
             (None, Some(ms)) => format!("  |  {ms:.0} ms"),
@@ -638,52 +575,6 @@ mod tests {
         assert_eq!(e.precision(), Precision::Perturbation);
     }
 
-    fn stats(samples: u64, max_escaped: u32, near_limit: u32, interior: u32) -> FrameStats {
-        FrameStats { gpu_ms: 0.0, samples, max_escaped, near_limit, interior }
-    }
-
-    #[test]
-    fn auto_iterations_grow_shrink_and_settle() {
-        let mut e = Explorer::new(800, 600);
-        e.iter_limit = 1000;
-        // Lots of samples escaping just under the limit: cut off, so grow.
-        assert!(e.observe(&stats(100_000, 999, 5_000, 20_000), false));
-        assert_eq!(e.iter_limit, 2000);
-        // Slowest escape far below the limit, but only part of the view: keep.
-        assert!(!e.observe(&stats(100_000, 300, 0, 20_000), false));
-        // Mostly black, and most of what escaped did so near the limit: the
-        // view is under-iterated even though few samples are near the limit.
-        e.iter_limit = 2000;
-        assert!(e.observe(&stats(100_000, 1990, 50, 99_900), true));
-        assert_eq!(e.iter_limit, 4000);
-        e.iter_limit = 2000;
-        // Same over the whole view: shrink to 2x it.
-        assert!(e.observe(&stats(100_000, 300, 0, 20_000), true));
-        assert_eq!(e.iter_limit, 600);
-        // Same frame again: stable.
-        assert!(!e.observe(&stats(100_000, 300, 0, 20_000), true));
-        // Manual mode ignores stats.
-        e.scale_iter_limit(2.0);
-        assert!(!e.observe(&stats(100_000, 1, 0, 0), true));
-    }
-
-    #[test]
-    fn iterations_track_zoom_depth() {
-        let mut e = Explorer::new(800, 600);
-        e.iter_limit = 1000;
-        // 1e5 zoom in many small steps, like a pinch.
-        for _ in 0..100 {
-            e.zoom_at_center(1e5f64.powf(0.01));
-        }
-        let expected = 1000.0 * 1e5f64.powf(ITERS_PER_ZOOM);
-        let got = e.iter_limit as f64;
-        assert!((got / expected - 1.0).abs() < 0.06, "{got} vs {expected}");
-        // Manual mode leaves it alone.
-        e.set_iter_limit(500);
-        e.zoom_at_center(1e5);
-        assert_eq!(e.iter_limit, 500);
-    }
-
     #[test]
     fn place_round_trips_across_window_sizes() {
         let mut e = Explorer::new(800, 600);
@@ -713,18 +604,22 @@ mod tests {
     }
 
     #[test]
-    fn sudden_jumps_raise_iterations_only_a_little() {
+    fn depth_input_is_queued_for_the_policy_in_order() {
         let mut e = Explorer::new(800, 600);
-        let before = e.iter_limit;
+        assert_eq!(e.take_inputs(), [Input::Reset { zoom: 1.0 }]);
+        e.zoom_at(10.0, 20.0, 4.0);
+        e.scale_detail(1.5);
         let mut deep = e.home_place();
-        deep.span = 1e-80;
+        deep.span /= 1e6;
         e.go_to(&deep);
-        // The full prediction would be ~1500x; statistics ramp up from here.
-        assert!(e.iter_limit > before && e.iter_limit as f64 <= before as f64 * MAX_PREDICTED_GROWTH);
-        // Jumping back out shrinks freely.
-        e.iter_limit = 50_000;
-        e.go_to(&e.home_place());
-        assert!(e.iter_limit < 50_000 / 100, "{}", e.iter_limit);
+        e.set_iter_limit(5000);
+        let got = e.take_inputs();
+        assert!(matches!(got[0], Input::Zoom(f) if (f - 4.0).abs() < 1e-9), "{got:?}");
+        assert_eq!(got[1], Input::ScaleDetail(1.5));
+        assert!(matches!(got[2], Input::Zoom(f) if (f - 1e6 / 4.0).abs() < 1e-3), "{got:?}");
+        assert_eq!(got[3], Input::SetLimit(5000));
+        assert_eq!(e.iter_limit, 5000, "a fixed limit applies at once");
+        assert!(e.take_inputs().is_empty());
     }
 
     #[test]

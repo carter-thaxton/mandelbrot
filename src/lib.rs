@@ -1,9 +1,10 @@
 //! Mandelbrot explorer library: everything except the window and CLI, which
 //! live in `main.rs`.
 //!
-//! - [`app`]: platform-independent explorer state (navigation, iteration
-//!   policy, reference orbit lifecycle) producing [`app::FrameParams`]
+//! - [`app`]: platform-independent explorer state (navigation, reference
+//!   orbit lifecycle) producing [`app::FrameParams`]
 //! - [`progressive`]: schedules GPU work into budget-sized, reusable tiles
+//! - [`policy`]: decides that work and its iteration limits
 //! - [`render`]: the backend-agnostic [`render::Renderer`] interface and the
 //!   Metal backend
 //! - [`bookmarks`], [`flight`]: saved places and smooth zoom-and-pan flights
@@ -22,5 +23,6 @@ pub mod bookmarks;
 pub mod flight;
 pub mod harness;
 pub mod perturb;
+pub mod policy;
 pub mod progressive;
 pub mod render;
