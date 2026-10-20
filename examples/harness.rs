@@ -1,6 +1,6 @@
 //! Play the evaluation scenarios (see `mandelbrot::harness`).
 //!
-//! `cargo run --release --example harness -- [SCENARIO...] [--size WxH] [--csv DIR] [--no-truncation]`
+//! `cargo run --release --example harness -- [SCENARIO...] [--size WxH] [--csv DIR]
 //!   Real runs: frame times and image quality per scenario.
 //!
 //! `cargo run --release --example harness -- --compat record|check FILE [SCENARIO...]`
@@ -31,7 +31,6 @@ fn run() -> Result<(), String> {
                 cfg.height = h.parse().map_err(|_| "bad height")?;
             }
             "--csv" => csv = Some(val()?),
-            "--no-truncation" => cfg.truncation_every = 0,
             "--compat" => compat = Some((val()?, val()?)),
             name => names.push(name.to_string()),
         }

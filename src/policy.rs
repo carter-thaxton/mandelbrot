@@ -13,8 +13,10 @@
 //! User input that affects iteration depth (zooming, the detail keys) reaches
 //! the policy as [`Input`] events, queued by the explorer.
 //!
-//! [`Policy::master`] is the behavior the explorer had before policies
-//! existed, exactly: one automatic iteration limit for the whole view,
+//! A policy's tuning parameters are its [`Settings`]. New mechanisms join
+//! them switched off: [`Settings::master`] is the behavior the explorer had
+//! before policies existed, exactly, and the harness's recorded fingerprint
+//! checks that it stays so. That behavior: one automatic iteration limit for the whole view,
 //! predicted from the zoom depth and corrected from GPU statistics, judged
 //! on whole-view evidence only. A single batch is a biased sample (a few
 //! tiles along the set's boundary always look under-iterated), and acting on
@@ -32,7 +34,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::render::{BatchStats, FrameStats, TILE, TileStats};
+use crate::render::{BatchStats, DEFAULT_ROUGH_MU, FrameStats, TILE, TileStats};
 
 pub const MIN_ITER: u32 = 256;
 pub const MAX_ITER: u32 = 200_000;
@@ -53,6 +55,8 @@ const ITERS_PER_ZOOM: f64 = 0.04;
 /// double it cheaply until it's enough, then stop.
 const MAX_PREDICTED_GROWTH: f64 = 2.0;
 
+// The master settings (see [`Settings`]).
+
 /// GPU time to aim for per frame (ms). Leaves headroom inside a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 12.0;
 /// Never compute fewer samples per frame than this. A dispatch lasts at least
@@ -65,6 +69,48 @@ const MIN_SAMPLES_PER_FRAME: f64 = 65536.0;
 const PROBE_INTERVAL: Duration = Duration::from_millis(120);
 /// Probes sample at least this coarsely (they only need statistics).
 const PROBE_MIN_STEP: u32 = 4;
+
+/// A policy's tuning parameters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Settings {
+    /// GPU time to aim for per frame (ms).
+    pub budget_ms: f64,
+    /// Never compute fewer samples per frame than this.
+    pub min_samples_per_frame: f64,
+    /// Minimum time between statistics probes while the view keeps changing
+    /// (zero: on every change).
+    pub probe_interval: Duration,
+    /// Probes sample at least this coarsely.
+    pub probe_min_step: u32,
+    /// Depth predictor: each zoom by f scales the limit by f^this.
+    pub iters_per_zoom: f64,
+    /// Most the predictor may raise the limit in one view change.
+    pub max_predicted_growth: f64,
+    /// Adjacent samples whose mu differ by more than this count as rough
+    /// (see `TileStats::rough`).
+    pub rough_mu: f32,
+}
+
+impl Settings {
+    /// The explorer's behavior before policies (see the module docs).
+    pub fn master() -> Self {
+        Self {
+            budget_ms: FRAME_BUDGET_MS,
+            min_samples_per_frame: MIN_SAMPLES_PER_FRAME,
+            probe_interval: PROBE_INTERVAL,
+            probe_min_step: PROBE_MIN_STEP,
+            iters_per_zoom: ITERS_PER_ZOOM,
+            max_predicted_growth: MAX_PREDICTED_GROWTH,
+            rough_mu: DEFAULT_ROUGH_MU,
+        }
+    }
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self::master()
+    }
+}
 
 /// Starting guess for the iteration limit at `zoom` (auto mode then corrects
 /// it from what the GPU actually sees).
@@ -179,6 +225,7 @@ impl Sweep {
 }
 
 pub struct Policy {
+    settings: Settings,
     /// The iteration limit for the whole view.
     limit: u32,
     /// Adjust `limit` from GPU statistics (see [`Policy::judge`]).
@@ -188,7 +235,7 @@ pub struct Policy {
     drift: f64,
     /// Current sweep (reset on any change).
     sweep: Option<Sweep>,
-    /// Samples to compute per frame to fill FRAME_BUDGET_MS; 0 until first
+    /// Samples to compute per frame to fill the budget; 0 until first
     /// measured (see [`Policy::record`]).
     samples_per_frame: f64,
     /// The view or limit changed since the last statistics probe.
@@ -197,7 +244,6 @@ pub struct Policy {
     /// Probe statistics accumulated until there are enough to decide on
     /// (coarse probes of expensive views have only a few thousand samples).
     probe_stats: FrameStats,
-    probe_interval: Duration,
 }
 
 impl Default for Policy {
@@ -207,9 +253,9 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// The explorer's behavior before policies: see the module docs.
-    pub fn master() -> Self {
+    pub fn new(settings: Settings) -> Self {
         Self {
+            settings,
             limit: MIN_ITER,
             auto: true,
             drift: 1.0,
@@ -218,15 +264,16 @@ impl Policy {
             probe_due: false,
             last_probe: None,
             probe_stats: FrameStats::default(),
-            probe_interval: PROBE_INTERVAL,
         }
     }
 
-    /// Probe statistics at most every `interval` while the view changes
-    /// (zero: on every change).
-    pub fn with_probe_interval(mut self, interval: Duration) -> Self {
-        self.probe_interval = interval;
-        self
+    /// With [`Settings::master`].
+    pub fn master() -> Self {
+        Self::new(Settings::master())
+    }
+
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     /// The limit the reference orbit must cover: no tile goes deeper.
@@ -263,12 +310,13 @@ impl Policy {
     }
 
     /// In auto mode, scale the limit with a zoom by `factor` (> 1 zooms in),
-    /// in >= 5% steps. Growth is capped per call (MAX_PREDICTED_GROWTH);
+    /// in >= 5% steps. Growth is capped per call (max_predicted_growth);
     /// shrinking isn't, since it's cheap and the statistics raise it again
     /// if needed.
     fn track_depth(&mut self, factor: f64) {
         if self.auto {
-            self.drift *= factor.powf(ITERS_PER_ZOOM).min(MAX_PREDICTED_GROWTH);
+            let s = &self.settings;
+            self.drift *= factor.powf(s.iters_per_zoom).min(s.max_predicted_growth);
             if !(1.0 / 1.05..=1.05).contains(&self.drift) {
                 let n = self.limit as f64 * self.drift;
                 self.limit = n.round().clamp(MIN_ITER as f64, MAX_ITER as f64) as u32;
@@ -326,9 +374,9 @@ impl Policy {
     fn budget_samples(&self, input: &PlanInput) -> f64 {
         if self.samples_per_frame == 0.0 {
             // Unknown cost: assume a 4x4-block preview of the view fits.
-            (input.width as f64 * input.height as f64 / 16.0).max(MIN_SAMPLES_PER_FRAME)
+            (input.width as f64 * input.height as f64 / 16.0).max(self.settings.min_samples_per_frame)
         } else {
-            self.samples_per_frame.max(MIN_SAMPLES_PER_FRAME)
+            self.samples_per_frame.max(self.settings.min_samples_per_frame)
         }
     }
 
@@ -342,9 +390,10 @@ impl Policy {
     /// Choose this frame's work.
     pub fn plan(&self, input: &PlanInput) -> Plan {
         let probe_due = self.probe_due || input.change == Change::Changed;
-        if probe_due && self.auto && self.last_probe.is_none_or(|t| input.now.duration_since(t) >= self.probe_interval) {
+        let s = &self.settings;
+        if probe_due && self.auto && self.last_probe.is_none_or(|t| input.now.duration_since(t) >= s.probe_interval) {
             // Spend this frame on whole-view statistics.
-            return Plan::Probe { step: self.preview_step(input).max(PROBE_MIN_STEP) };
+            return Plan::Probe { step: self.preview_step(input).max(s.probe_min_step) };
         }
         match self.pick(input) {
             Some((tiles, step)) => {
@@ -431,12 +480,12 @@ impl Policy {
 
     /// Size the next frame's work from how long this draw took: drop at once
     /// when over budget, grow at most 2x per frame when under (see also
-    /// MIN_SAMPLES_PER_FRAME).
+    /// min_samples_per_frame).
     fn record(&mut self, stats: &FrameStats) {
         if stats.samples == 0 {
             return;
         }
-        let target = stats.samples as f64 * FRAME_BUDGET_MS / stats.gpu_ms.max(1e-3);
+        let target = stats.samples as f64 * self.settings.budget_ms / stats.gpu_ms.max(1e-3);
         let current = self.samples_per_frame;
         self.samples_per_frame = if current == 0.0 { target } else { target.min(current * 2.0) };
     }
@@ -452,6 +501,12 @@ mod tests {
 
     fn with_limit(limit: u32) -> Policy {
         Policy { limit, ..Policy::master() }
+    }
+
+    #[test]
+    fn master_is_the_default() {
+        assert_eq!(Settings::default(), Settings::master());
+        assert_eq!(Policy::default().settings(), &Settings::master());
     }
 
     #[test]

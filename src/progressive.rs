@@ -154,6 +154,11 @@ impl Scheduler {
         &self.policy
     }
 
+    /// The canvas's tiles, row-major (empty before the first step).
+    pub fn tiles(&self) -> &[TileState] {
+        self.canvas.as_ref().map_or(&[], |c| &c.tiles)
+    }
+
     /// The renderer's canvas was recreated (e.g. window resize): forget it.
     pub fn reset(&mut self) {
         self.canvas = None;
@@ -266,12 +271,14 @@ impl Scheduler {
                 if stale {
                     present(renderer, &mut self.presented)?;
                 }
-                let probe = TileBatch::all(input.width, input.height, params.max_iter, *step, Output::StatsOnly);
+                let mut probe = TileBatch::all(input.width, input.height, params.max_iter, *step, Output::StatsOnly);
+                probe.rough_mu = self.policy.settings().rough_mu;
                 Some(renderer.draw(&params, &probe)?)
             }
             Plan::Draw { tiles, step, limits } => {
                 let jobs = tiles.iter().zip(limits).map(|(&i, &l)| TileJob::new(input.tiles[i].origin, l)).collect();
-                let stats = renderer.draw(&params, &TileBatch::new(jobs, *step, Output::Pixels))?;
+                let batch = TileBatch { rough_mu: self.policy.settings().rough_mu, ..TileBatch::new(jobs, *step, Output::Pixels) };
+                let stats = renderer.draw(&params, &batch)?;
                 present(renderer, &mut self.presented)?;
                 Some(stats)
             }

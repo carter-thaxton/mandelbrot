@@ -23,10 +23,14 @@
 //!
 //! Quality, as fractions of pixels whose color differs noticeably
 //! ([`differing`]):
-//!   - error: what's displayed vs. an exact render of the same view at the
-//!     same iteration limit (blockiness, blur and staleness together)
-//!   - truncation: that exact render vs. one at TRUNCATION_FACTOR times the
-//!     limit (detail lost to the limit itself)
+//!   - error: what's displayed vs. a deep reference, an exact render of the
+//!     same view at TRUNCATION_FACTOR times the frame's iteration limit. Each
+//!     wrong pixel is attributed by the state of its tile ([`error_by_cause`]):
+//!       - unfinished: the tile isn't computed exactly for this view yet
+//!         (blockiness, blur, staleness)
+//!       - truncation: it is, so the difference is detail its iteration
+//!         limit cuts off; *lowered* counts the part in tiles the policy gave
+//!         a lower limit than the frame's
 //!   - speckle: adjacent pixel pairs with very different colors ([`speckle`])
 //!   - popping: pixels changing from one frame to the next while still
 
@@ -35,16 +39,16 @@ use std::time::{Duration, Instant};
 use crate::app::{Colors, Explorer, FrameParams, Place};
 use crate::bookmarks::PRESETS;
 use crate::flight::Flight;
-use crate::policy::{MAX_ITER, Policy};
+use crate::policy::{MAX_ITER, Policy, Settings, TileState};
 use crate::progressive::Scheduler;
-use crate::render::{BatchStats, FrameStats, Output, Renderer, Reprojection, Result, TileBatch};
+use crate::render::{BatchStats, FrameStats, Output, Renderer, Reprojection, Result, TILE, TileBatch};
 
 pub const FPS: f64 = 120.0;
 /// Frame time at FPS (ms); longer frames count as jank.
 pub const FRAME_MS: f64 = 1000.0 / FPS;
 /// Every scenario ends holding still at least this long.
 const SETTLE_MIN_SECONDS: f64 = 2.0;
-/// Truncation is measured against this many times the frame's limit.
+/// The deep reference uses this many times the frame's limit.
 const TRUNCATION_FACTOR: u32 = 4;
 /// Frames between fingerprint checkpoints.
 const CHECKPOINT_FRAMES: usize = 60;
@@ -148,15 +152,13 @@ pub struct Config {
     pub deterministic: bool,
     /// Hash every frame into a fingerprint.
     pub fingerprint: bool,
-    /// Measure image quality (snapshots every frame, exact references).
+    /// Measure image quality (snapshots every frame, deep references).
     pub metrics: bool,
-    /// While moving, measure error every this many frames.
+    /// While moving, measure error every this many frames (always while
+    /// still).
     pub error_every: usize,
-    /// While moving, measure truncation every this many frames (0: never;
-    /// it's always measured once settled).
-    pub truncation_every: usize,
-    /// The policy under test.
-    pub policy: fn() -> Policy,
+    /// Settings of the policy under test.
+    pub settings: Settings,
 }
 
 impl Config {
@@ -169,8 +171,7 @@ impl Config {
             fingerprint: false,
             metrics: true,
             error_every: 12,
-            truncation_every: 60,
-            policy: Policy::master,
+            settings: Settings::master(),
         }
     }
 
@@ -183,8 +184,7 @@ impl Config {
             fingerprint: true,
             metrics: false,
             error_every: 0,
-            truncation_every: 0,
-            policy: Policy::master,
+            settings: Settings::master(),
         }
     }
 }
@@ -208,8 +208,11 @@ pub struct Frame {
     pub max_iter: u32,
     /// The scheduler had more work to do.
     pub busy: bool,
+    /// See the module docs; error = unfinished + truncation.
     pub error: Option<f64>,
+    pub unfinished: Option<f64>,
     pub truncation: Option<f64>,
+    pub lowered: Option<f64>,
     pub speckle: Option<f64>,
     pub popping: Option<f64>,
 }
@@ -342,11 +345,10 @@ impl Renderer for Recorder<'_> {
     }
 }
 
-/// Exact renders for one view and limit, kept while the view holds still.
+/// A deep render for one view and limit, kept while the view holds still.
 struct Reference {
     key: (u64, u32),
-    exact: Vec<u8>,
-    truncation: Option<f64>,
+    deep: Vec<u8>,
 }
 
 /// Plays one scenario.
@@ -422,28 +424,27 @@ impl Player<'_> {
                 });
             }
             let n = self.frames.len();
-            let every = |k: usize| k > 0 && n.is_multiple_of(k);
-            if !moving || every(self.cfg.error_every) {
-                let truncation = moving && every(self.cfg.truncation_every);
-                let r = self.reference(truncation)?;
-                f.error = Some(differing(&shown, &r.exact));
-                f.truncation = if truncation { r.truncation } else { None };
+            if !moving || (self.cfg.error_every > 0 && n.is_multiple_of(self.cfg.error_every)) {
+                let limit = self.rec.params.as_ref().expect("a frame was drawn").max_iter;
+                self.update_reference()?;
+                let deep = &self.reference.as_ref().unwrap().deep;
+                let e = error_by_cause(&shown, deep, self.s.tiles(), self.cfg.width, limit);
+                f.unfinished = Some(e.unfinished);
+                f.truncation = Some(e.truncation);
+                f.lowered = Some(e.lowered);
+                f.error = Some(e.unfinished + e.truncation);
             }
             self.last_snapshot = Some(shown);
         }
         Ok(f)
     }
 
-    /// Exact renders of the current view at the canvas's iteration limit
-    /// (and, if `truncation`, at TRUNCATION_FACTOR times it).
-    fn reference(&mut self, truncation: bool) -> Result<&Reference> {
-        let p = self.rec.params.clone().expect("a frame was drawn");
+    /// Make `reference` a deep render of the current view: TRUNCATION_FACTOR
+    /// times the frame's limit.
+    fn update_reference(&mut self) -> Result<()> {
+        let p = self.rec.params.as_ref().expect("a frame was drawn");
         let key = (self.epoch, p.max_iter);
         if self.reference.as_ref().is_none_or(|r| r.key != key) {
-            let (exact, _) = self.rec.inner.capture(&p, 1, &self.e.colors())?;
-            self.reference = Some(Reference { key, exact, truncation: None });
-        }
-        if truncation && self.reference.as_ref().unwrap().truncation.is_none() {
             let mut x = Explorer::new(self.e.width, self.e.height);
             x.center = self.e.center.clone();
             x.scale = self.e.scale;
@@ -451,10 +452,9 @@ impl Player<'_> {
             x.series_skip = self.e.series_skip;
             x.set_iter_limit(p.max_iter.saturating_mul(TRUNCATION_FACTOR).min(MAX_ITER));
             let (deep, _) = self.rec.inner.capture(&x.frame_params(), 1, &self.e.colors())?;
-            let r = self.reference.as_mut().unwrap();
-            r.truncation = Some(differing(&r.exact, &deep));
+            self.reference = Some(Reference { key, deep });
         }
-        Ok(self.reference.as_ref().unwrap())
+        Ok(())
     }
 
     fn push(&mut self, f: Frame) {
@@ -528,15 +528,6 @@ impl Player<'_> {
         }
         unreachable!()
     }
-
-    /// Truncation of the final, settled image.
-    fn measure_final(&mut self) -> Result<()> {
-        if self.cfg.metrics && !self.frames.is_empty() {
-            let truncation = self.reference(true)?.truncation;
-            self.frames.last_mut().unwrap().truncation = truncation;
-        }
-        Ok(())
-    }
 }
 
 /// Play `scenario` on `renderer` (which is resized to the config's size).
@@ -548,7 +539,7 @@ pub fn run(scenario: &Scenario, cfg: &Config, renderer: &mut dyn Renderer) -> Re
     let mut p = Player {
         cfg,
         e,
-        s: Scheduler::with_policy((cfg.policy)()),
+        s: Scheduler::with_policy(Policy::new(cfg.settings.clone())),
         rec: Recorder {
             inner: renderer,
             model_cost: cfg.deterministic.then_some(MODEL_MS_PER_SAMPLE_ITER),
@@ -581,7 +572,6 @@ pub fn run(scenario: &Scenario, cfg: &Config, renderer: &mut dyn Renderer) -> Re
         p.play(action)?;
     }
     p.settle(scenario.settle_max)?;
-    p.measure_final()?;
     if p.checkpoints.last().is_none_or(|c| c.0 != p.frames.len()) {
         p.checkpoint();
     }
@@ -593,6 +583,38 @@ pub fn run(scenario: &Scenario, cfg: &Config, renderer: &mut dyn Renderer) -> Re
 pub fn differing(a: &[u8], b: &[u8]) -> f64 {
     let bad = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| (0..3).any(|i| x[i].abs_diff(y[i]) > 16)).count();
     bad as f64 / (a.len() / 4).max(1) as f64
+}
+
+/// Error against a deep reference, split by the cause each wrong pixel's
+/// tile suggests (see the module docs). Fractions of all pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ErrorByCause {
+    pub unfinished: f64,
+    pub truncation: f64,
+    /// The part of `truncation` in tiles computed below `frame_limit`.
+    pub lowered: f64,
+}
+
+/// Compare `shown` with `deep` (RGBA, `width` wide), attributing each
+/// differing pixel by its canvas tile (row-major [`TileState`]s).
+pub fn error_by_cause(shown: &[u8], deep: &[u8], tiles: &[TileState], width: u32, frame_limit: u32) -> ErrorByCause {
+    let cols = width.div_ceil(TILE) as usize;
+    let (mut unfinished, mut truncated, mut lowered) = (0u64, 0u64, 0u64);
+    for (i, (a, b)) in shown.chunks(4).zip(deep.chunks(4)).enumerate() {
+        if !(0..3).any(|c| a[c].abs_diff(b[c]) > 16) {
+            continue;
+        }
+        let (x, y) = (i % width as usize, i / width as usize);
+        let t = &tiles[(y / TILE as usize) * cols + x / TILE as usize];
+        if !t.exact {
+            unfinished += 1;
+        } else {
+            truncated += 1;
+            lowered += (t.limit < frame_limit) as u64;
+        }
+    }
+    let n = (shown.len() / 4).max(1) as f64;
+    ErrorByCause { unfinished: unfinished as f64 / n, truncation: truncated as f64 / n, lowered: lowered as f64 / n }
 }
 
 /// Fraction of horizontally or vertically adjacent pixel pairs whose colors
@@ -650,6 +672,8 @@ pub struct Summary {
     pub truncation_moving: Option<f64>,
     /// Truncation of the final image.
     pub truncation_final: Option<f64>,
+    /// The part of `truncation_final` in tiles given lower limits.
+    pub lowered_final: Option<f64>,
     pub speckle_moving: Option<f64>,
     pub speckle_final: Option<f64>,
     /// Sum of per-frame popping over still frames: how many times, on
@@ -689,6 +713,7 @@ impl Run {
             error_still: pick(false, |f| f.error),
             truncation_moving: pick(true, |f| f.truncation),
             truncation_final: f.last().and_then(|f| f.truncation),
+            lowered_final: f.last().and_then(|f| f.lowered),
             speckle_moving: pick(true, |f| f.speckle),
             speckle_final: f.last().and_then(|f| f.speckle),
             popping: f.iter().any(|f| f.popping.is_some()).then(|| f.iter().filter_map(|f| f.popping).sum()),
@@ -707,11 +732,11 @@ impl Run {
     pub fn csv(&self) -> String {
         let opt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.6}"));
         let mut out = String::from(
-            "t,moving,settling,wall_ms,gpu_ms,samples,pixel_draws,stats_draws,reprojections,max_iter,busy,error,truncation,speckle,popping\n",
+            "t,moving,settling,wall_ms,gpu_ms,samples,pixel_draws,stats_draws,reprojections,max_iter,busy,error,unfinished,truncation,lowered,speckle,popping\n",
         );
         for f in &self.frames {
             out += &format!(
-                "{:.4},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{}\n",
+                "{:.4},{},{},{:.3},{:.3},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 f.t,
                 f.moving as u8,
                 f.settling as u8,
@@ -724,7 +749,9 @@ impl Run {
                 f.max_iter,
                 f.busy as u8,
                 opt(f.error),
+                opt(f.unfinished),
                 opt(f.truncation),
+                opt(f.lowered),
                 opt(f.speckle),
                 opt(f.popping),
             );
@@ -735,13 +762,13 @@ impl Run {
 
 impl Summary {
     pub const HEADER: &str = "scenario     frames  wall ms p50/p90/p99/max   >8.3ms  jank ms²  gpu p50/p90  \
-                              error mov/still  trunc mov/final  speckle mov/final  popping  idle s  quiet s  iters";
+                              error mov/still  trunc mov/final  lowered  speckle mov/final  popping  idle s  quiet s  iters";
 
     pub fn row(&self) -> String {
         let pct = |v: Option<f64>| v.map_or("    -".to_string(), |v| format!("{:5.2}", v * 100.0));
         let secs = |v: Option<f64>| v.map_or("   -".to_string(), |v| format!("{v:4.2}"));
         format!(
-            "{:<11} {:>7}  {:5.1}/{:5.1}/{:5.1}/{:6.1}  {:5.1}%  {:8.1}  {:5.1}/{:5.1}  {}/{}%      {}/{}%      {}/{}%      {}  {:>6}  {:>7}  {}",
+            "{:<11} {:>7}  {:5.1}/{:5.1}/{:5.1}/{:6.1}  {:5.1}%  {:8.1}  {:5.1}/{:5.1}  {}/{}%      {}/{}%   {}%      {}/{}%      {}  {:>6}  {:>7}  {}",
             self.name,
             self.frames,
             self.wall[0],
@@ -756,6 +783,7 @@ impl Summary {
             pct(self.error_still),
             pct(self.truncation_moving),
             pct(self.truncation_final),
+            pct(self.lowered_final),
             pct(self.speckle_moving),
             pct(self.speckle_final),
             self.popping.map_or("    -".to_string(), |v| format!("{v:5.2}")),
@@ -832,6 +860,31 @@ mod tests {
         let a = [100, 100, 100, 255, 0, 0, 0, 255];
         let b = [110, 90, 116, 0, 0, 40, 0, 255];
         assert_eq!(differing(&a, &b), 0.5);
+    }
+
+    #[test]
+    fn errors_are_attributed_by_tile_state() {
+        // Two tiles side by side, one pixel row: 32 x 1.
+        let width = 2 * TILE;
+        let px = |v: u8| [v, v, v, 255];
+        let deep: Vec<u8> = (0..width).flat_map(|_| px(100)).collect();
+        let mut shown = deep.clone();
+        // 4 wrong pixels in the left tile, 2 in the right; one off by too
+        // little to count.
+        for x in [0, 1, 2, 3, 20, 21] {
+            shown[x * 4..x * 4 + 4].copy_from_slice(&px(200));
+        }
+        shown[25 * 4..25 * 4 + 4].copy_from_slice(&px(110));
+        let tile = |x, exact, limit| TileState { exact, limit, res: 1.0, ..TileState::missing([x, 0]) };
+        let n = width as f64;
+
+        let unfinished = [tile(0, false, 1000), tile(TILE, true, 1000)];
+        let e = error_by_cause(&shown, &deep, &unfinished, width, 1000);
+        assert_eq!(e, ErrorByCause { unfinished: 4.0 / n, truncation: 2.0 / n, lowered: 0.0 });
+
+        let lowered = [tile(0, true, 1000), tile(TILE, true, 500)];
+        let e = error_by_cause(&shown, &deep, &lowered, width, 1000);
+        assert_eq!(e, ErrorByCause { unfinished: 0.0, truncation: 6.0 / n, lowered: 2.0 / n });
     }
 
     #[test]
