@@ -28,7 +28,7 @@ use objc2_metal::{
 use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{BatchStats, FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileStats};
+use super::{BatchStats, ESCAPE_BINS, EscapeHistogram, FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileStats};
 use crate::app::{Colors, FrameParams};
 use crate::perturb::ReferenceOrbit;
 
@@ -94,6 +94,9 @@ pub struct MetalRenderer {
     empty_buffer: Retained<Buffer>,
     /// Per-tile kernel statistics (shared memory), grown as batches need.
     tile_stats: Retained<Buffer>,
+    /// The batch's escape-count histogram (shared memory, zeroed before
+    /// each dispatch).
+    escapes: Retained<Buffer>,
 }
 
 impl MetalRenderer {
@@ -107,6 +110,7 @@ impl MetalRenderer {
         let layer = window.map(|w| attach_layer(w, &device)).transpose()?;
         let empty_buffer = new_buffer(&device, &[0u8; 64])?;
         let tile_stats = new_buffer(&device, &[GpuTileStats::default(); 64])?;
+        let escapes = new_buffer(&device, &[0u32; ESCAPE_BINS])?;
         Ok(Self {
             device,
             queue,
@@ -119,6 +123,7 @@ impl MetalRenderer {
             reference: None,
             empty_buffer,
             tile_stats,
+            escapes,
         })
     }
 
@@ -161,6 +166,10 @@ impl MetalRenderer {
                 .ok_or("failed to allocate Metal buffer")?;
         }
 
+        // SAFETY: the buffer holds ESCAPE_BINS u32s, and the GPU is idle
+        // (every command buffer is waited on).
+        unsafe { self.escapes.contents().cast::<[u32; ESCAPE_BINS]>().write([0; ESCAPE_BINS]) };
+
         let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
         enc.setComputePipelineState(&self.pipeline);
         let tiles = if size_of_val(batch.tiles.as_slice()) > 4096 {
@@ -168,7 +177,7 @@ impl MetalRenderer {
         } else {
             None
         };
-        // SAFETY: texture 0 / buffers 0-3 match the kernel signature, setBytes
+        // SAFETY: texture 0 / buffers 0-4 match the kernel signature, setBytes
         // copies its data before returning, the kernel reads at most `ref_len`
         // reference points and one tile per grid slice, writes one stats
         // entry per tile (the buffer holds at least n), and only writes
@@ -182,6 +191,7 @@ impl MetalRenderer {
             );
             enc.setBuffer_offset_atIndex(Some(&reference), 0, 1);
             enc.setBuffer_offset_atIndex(Some(&self.tile_stats), 0, 2);
+            enc.setBuffer_offset_atIndex(Some(&self.escapes), 0, 4);
             match &tiles {
                 Some(buffer) => enc.setBuffer_offset_atIndex(Some(buffer), 0, 3),
                 None => enc.setBytes_length_atIndex(
@@ -239,7 +249,10 @@ impl MetalRenderer {
                 edge: s.edge,
             })
             .collect();
-        Ok(BatchStats::of_tiles((cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0, tiles))
+        let mut stats = BatchStats::of_tiles((cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0, tiles);
+        // SAFETY: the GPU has finished writing the histogram.
+        stats.total.escapes = EscapeHistogram(unsafe { self.escapes.contents().cast::<[u32; ESCAPE_BINS]>().read() });
+        Ok(stats)
     }
 
     fn new_texture(&self, w: usize, h: usize, format: MTLPixelFormat, shared: bool) -> Result<Retained<Texture>> {

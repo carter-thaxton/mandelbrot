@@ -162,7 +162,8 @@ pub struct Config {
 }
 
 impl Config {
-    /// Window-sized, real timing, with quality metrics.
+    /// Window-sized, real timing, with quality metrics, with the app's
+    /// settings.
     pub fn real() -> Self {
         Self {
             width: 2400,
@@ -171,7 +172,7 @@ impl Config {
             fingerprint: false,
             metrics: true,
             error_every: 12,
-            settings: Settings::master(),
+            settings: Settings::tuned(),
         }
     }
 
@@ -225,6 +226,10 @@ pub struct Run {
     pub checkpoints: Vec<(usize, u64)>,
     /// Frames (and seconds) spent settling at the start, before frame 0.
     pub warmup_frames: usize,
+    /// The final frame as displayed, and its deep reference (RGBA rows;
+    /// with metrics only).
+    pub final_image: Option<Vec<u8>>,
+    pub final_deep: Option<Vec<u8>>,
 }
 
 /// 64-bit FNV-1a: tiny, and stable across Rust versions and runs.
@@ -575,7 +580,14 @@ pub fn run(scenario: &Scenario, cfg: &Config, renderer: &mut dyn Renderer) -> Re
     if p.checkpoints.last().is_none_or(|c| c.0 != p.frames.len()) {
         p.checkpoint();
     }
-    Ok(Run { name: scenario.name, frames: p.frames, checkpoints: p.checkpoints, warmup_frames: warmup })
+    Ok(Run {
+        name: scenario.name,
+        frames: p.frames,
+        checkpoints: p.checkpoints,
+        warmup_frames: warmup,
+        final_image: p.last_snapshot,
+        final_deep: p.reference.map(|r| r.deep),
+    })
 }
 
 /// Fraction of pixels whose color differs noticeably (any channel by more

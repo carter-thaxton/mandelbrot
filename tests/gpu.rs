@@ -177,9 +177,18 @@ fn tile_stats_do_not_depend_on_the_rest_of_the_batch() {
         assert_eq!(together.tiles.len(), all.tiles.len());
 
         let reversed: Vec<TileJob> = all.tiles.iter().rev().copied().collect();
-        let mut backwards = r.draw(&p, &TileBatch::new(reversed, step, Output::StatsOnly)).unwrap().tiles;
+        let backwards = r.draw(&p, &TileBatch::new(reversed, step, Output::StatsOnly)).unwrap();
+        assert_eq!(together.total.escapes, backwards.total.escapes, "step {step}: order changed the histogram");
+        let mut backwards = backwards.tiles;
         backwards.reverse();
         assert_eq!(together.tiles, backwards, "step {step}: order changed the stats");
+
+        // The escape histogram counts every escaped sample once, the
+        // slowest in its top bin.
+        let t = &together.total;
+        assert_eq!(t.escapes.total(), t.samples - t.interior as u64, "step {step}");
+        let top = t.escapes.quantile(1.0).unwrap();
+        assert!(top > t.max_escaped && top as f64 <= t.max_escaped as f64 * 1.2 + 1.0, "step {step}: {top} vs {}", t.max_escaped);
 
         for i in (0..all.tiles.len()).step_by(7) {
             let alone = r.draw(&p, &TileBatch::new(vec![all.tiles[i]], step, Output::StatsOnly)).unwrap();

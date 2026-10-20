@@ -136,7 +136,8 @@ pub struct BatchStats {
 }
 
 impl BatchStats {
-    /// Totals merged from the tiles.
+    /// Totals merged from the tiles (all but the escape histogram, which
+    /// isn't kept per tile).
     pub fn of_tiles(gpu_ms: f64, tiles: Vec<TileStats>) -> Self {
         let mut total = FrameStats { gpu_ms, ..Default::default() };
         for t in &tiles {
@@ -146,6 +147,62 @@ impl BatchStats {
             total.interior += t.interior;
         }
         Self { total, tiles }
+    }
+}
+
+/// Bins of [`EscapeHistogram`]: enough for MAX_ITER. Must match the shader.
+pub const ESCAPE_BINS: usize = 72;
+/// Bins per doubling of the iteration count.
+pub const ESCAPE_BINS_PER_OCTAVE: f64 = 4.0;
+
+/// How many escaped samples needed how many iterations: bin b counts
+/// counts n with floor(log2(n) * ESCAPE_BINS_PER_OCTAVE) = b (n = 0 in bin 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EscapeHistogram(pub [u32; ESCAPE_BINS]);
+
+impl Default for EscapeHistogram {
+    fn default() -> Self {
+        Self([0; ESCAPE_BINS])
+    }
+}
+
+impl EscapeHistogram {
+    fn bin(n: u32) -> usize {
+        if n == 0 { 0 } else { (((n as f64).log2() * ESCAPE_BINS_PER_OCTAVE) as usize).min(ESCAPE_BINS - 1) }
+    }
+
+    /// Count one sample that escaped after `n` iterations.
+    pub fn record(&mut self, n: u32) {
+        self.0[Self::bin(n)] += 1;
+    }
+
+    pub fn merge(&mut self, other: &EscapeHistogram) {
+        for (a, b) in self.0.iter_mut().zip(&other.0) {
+            *a += b;
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.0.iter().map(|&c| c as u64).sum()
+    }
+
+    /// An iteration count that at least a fraction `q` of the samples
+    /// escaped within: the upper edge of the bin where that fraction is
+    /// reached (so at most ~19% above the exact quantile). None if empty.
+    pub fn quantile(&self, q: f64) -> Option<u32> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        let wanted = (q * total as f64).ceil().max(1.0) as u64;
+        let mut seen = 0;
+        for (b, &c) in self.0.iter().enumerate() {
+            seen += c as u64;
+            if seen >= wanted {
+                return Some(((b + 1) as f64 / ESCAPE_BINS_PER_OCTAVE).exp2().ceil() as u32);
+            }
+        }
+        unreachable!("the bins hold `total` samples")
     }
 }
 
@@ -162,6 +219,8 @@ pub struct FrameStats {
     pub near_limit: u32,
     /// Samples that never escaped (in the set, or under-iterated).
     pub interior: u32,
+    /// Distribution of the escaped samples' iteration counts.
+    pub escapes: EscapeHistogram,
 }
 
 impl FrameStats {
@@ -172,6 +231,7 @@ impl FrameStats {
         self.max_escaped = self.max_escaped.max(s.max_escaped);
         self.near_limit += s.near_limit;
         self.interior += s.interior;
+        self.escapes.merge(&s.escapes);
     }
 }
 
@@ -345,6 +405,27 @@ mod tests {
         let t = b.total;
         assert_eq!((t.gpu_ms, t.samples, t.max_escaped, t.near_limit, t.interior), (2.5, 576, 1200, 4, 266));
         assert_eq!(b.tiles.len(), 3);
+    }
+
+    #[test]
+    fn escape_quantiles_come_from_bin_edges() {
+        let mut h = EscapeHistogram::default();
+        assert_eq!(h.quantile(0.5), None);
+        // 999 fast samples (~100 iterations) and one slow one (~6000).
+        for _ in 0..999 {
+            h.record(100);
+        }
+        h.record(6000);
+        assert_eq!(h.total(), 1000);
+        // 100 is in the bin [2^6.5, 2^6.75): its upper edge, 108.
+        assert_eq!(h.quantile(0.5), Some(108));
+        assert_eq!(h.quantile(0.999), Some(108));
+        // The slowest sample's bin: 6000 is in [2^12.5, 2^12.75).
+        assert_eq!(h.quantile(1.0), Some(6889));
+        let mut both = h;
+        both.merge(&h);
+        assert_eq!(both.total(), 2000);
+        assert_eq!(both.quantile(0.999), Some(108));
     }
 
     #[test]

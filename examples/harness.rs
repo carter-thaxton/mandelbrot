@@ -1,7 +1,8 @@
 //! Play the evaluation scenarios (see `mandelbrot::harness`).
 //!
-//! `cargo run --release --example harness -- [SCENARIO...] [--size WxH] [--csv DIR]
-//!   Real runs: frame times and image quality per scenario.
+//! `cargo run --release --example harness -- [SCENARIO...] [--size WxH] [--csv DIR] [--png DIR] [--master]
+//!   Real runs: frame times and image quality per scenario; --png saves each
+//!   scenario's final frame and its deep reference.
 //!
 //! `cargo run --release --example harness -- --compat record|check FILE [SCENARIO...]`
 //!   Deterministic runs: record their fingerprints to FILE, or check them
@@ -20,6 +21,8 @@ fn main() {
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1);
     let (mut names, mut csv, mut compat) = (vec![], None, None);
+    let mut png: Option<String> = None;
+    let mut master = false;
     let mut cfg = Config::real();
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
@@ -31,12 +34,17 @@ fn run() -> Result<(), String> {
                 cfg.height = h.parse().map_err(|_| "bad height")?;
             }
             "--csv" => csv = Some(val()?),
+            "--png" => png = Some(val()?),
+            "--master" => master = true,
             "--compat" => compat = Some((val()?, val()?)),
             name => names.push(name.to_string()),
         }
     }
     if compat.is_some() {
         cfg = Config::compat();
+    }
+    if master {
+        cfg.settings = mandelbrot::policy::Settings::master();
     }
     let all = harness::scenarios();
     let known: Vec<_> = all.iter().map(|s| s.name).collect();
@@ -47,7 +55,12 @@ fn run() -> Result<(), String> {
 
     let mut r = render::create_headless()?;
     let mut fingerprints = String::new();
-    let mode = if cfg.deterministic { "deterministic" } else { "real" };
+    let mode = match (cfg.deterministic, cfg.settings == mandelbrot::policy::Settings::master()) {
+        (true, true) => "deterministic, master",
+        (true, false) => "deterministic",
+        (false, true) => "real, master",
+        (false, false) => "real",
+    };
     println!("{mode}, {}x{} at {} fps\n{}", cfg.width, cfg.height, harness::FPS, Summary::HEADER);
     for s in &chosen {
         let start = std::time::Instant::now();
@@ -55,6 +68,15 @@ fn run() -> Result<(), String> {
         if let Some(dir) = &csv {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
             std::fs::write(format!("{dir}/{}.csv", s.name), run.csv()).map_err(|e| e.to_string())?;
+        }
+        if let Some(dir) = &png {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            let images = [("", &run.final_image), ("-deep", &run.final_deep)];
+            for (suffix, image) in images {
+                if let Some(rgba) = image {
+                    write_png(&format!("{dir}/{}{suffix}.png", s.name), cfg.width, cfg.height, rgba)?;
+                }
+            }
         }
         fingerprints += &run.fingerprint();
         println!("{}  ({:.1} s)", run.summary().row(), start.elapsed().as_secs_f64());
@@ -79,4 +101,13 @@ fn run() -> Result<(), String> {
         None => {}
     }
     Ok(())
+}
+
+fn write_png(path: &str, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut writer = enc.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(rgba).map_err(|e| e.to_string())
 }

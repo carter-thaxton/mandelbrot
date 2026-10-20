@@ -64,6 +64,11 @@ constant uint MAX_GROUP_THREADS = 256;
 constant uint MAX_GROUP_TILES = 64;
 /// Shared-memory marker for samples outside the canvas.
 constant float NO_SAMPLE = -2.0;
+// Escape-count histogram: ESCAPE_BINS_PER_OCTAVE bins per doubling of the
+// iteration count (bin = floor(log2(n) * that), n >= 1). Must match
+// `EscapeHistogram` in src/render/mod.rs.
+constant uint ESCAPE_BINS = 72;
+constant float ESCAPE_BINS_PER_OCTAVE = 4.0;
 
 constant float BAILOUT2 = 65536.0; // |z| > 256: large radius for smooth coloring
 
@@ -393,6 +398,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
                        device const RefPoint* ref         [[buffer(1)]],
                        device TileStats* tile_stats       [[buffer(2)]],
                        device const TileJob* tiles        [[buffer(3)]],
+                       device atomic_uint* escapes        [[buffer(4)]],
                        uint3 gid                          [[thread_position_in_grid]],
                        uint3 lid                          [[thread_position_in_threadgroup]],
                        uint simd_width                    [[threads_per_simdgroup]])
@@ -454,10 +460,20 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
     threadgroup float shared_mu[MAX_GROUP_THREADS];
     threadgroup atomic_uint acc[MAX_GROUP_TILES * STAT_COUNT];
     threadgroup atomic_uint* mine = &acc[lid.z * STAT_COUNT];
+    // The threadgroup's escape histogram, zeroed and flushed by its first
+    // tile's threads (every threadgroup has a first tile).
+    threadgroup atomic_uint group_escapes[ESCAPE_BINS];
+    uint tile_threads = per_side * per_side;
+    uint in_tile = lid.y * per_side + lid.x;
     bool leader = lid.x == 0 && lid.y == 0;
     shared_mu[flat] = valid ? mu : NO_SAMPLE;
     if (leader) {
         for (uint k = 0; k < STAT_COUNT; ++k) atomic_store_explicit(&mine[k], 0, memory_order_relaxed);
+    }
+    if (lid.z == 0) {
+        for (uint b = in_tile; b < ESCAPE_BINS; b += tile_threads) {
+            atomic_store_explicit(&group_escapes[b], 0, memory_order_relaxed);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -477,6 +493,10 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         }
     }
     uint v[STAT_COUNT] = { n, n, uint(escaped && n > max_iter / 4 * 3), uint(valid && !escaped), rough, edge };
+    if (escaped) {
+        uint bin = n == 0 ? 0 : min(uint(log2(float(n)) * ESCAPE_BINS_PER_OCTAVE), ESCAPE_BINS - 1);
+        atomic_fetch_add_explicit(&group_escapes[bin], 1, memory_order_relaxed);
+    }
     if (per_side * per_side % simd_width == 0) {
         // Each SIMD group lies within one tile: reduce it first so only one
         // thread per group touches the atomics.
@@ -503,6 +523,12 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
         out_stats.interior = atomic_load_explicit(&mine[3], memory_order_relaxed);
         out_stats.rough = atomic_load_explicit(&mine[4], memory_order_relaxed);
         out_stats.edge = atomic_load_explicit(&mine[5], memory_order_relaxed);
+    }
+    if (lid.z == 0) {
+        for (uint b = in_tile; b < ESCAPE_BINS; b += tile_threads) {
+            uint count = atomic_load_explicit(&group_escapes[b], memory_order_relaxed);
+            if (count != 0) atomic_fetch_add_explicit(&escapes[b], count, memory_order_relaxed);
+        }
     }
 }
 

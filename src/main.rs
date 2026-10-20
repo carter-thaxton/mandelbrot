@@ -10,7 +10,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use mandelbrot::app::{self, Explorer, Precision, PrecisionMode};
 use mandelbrot::bookmarks::{Bookmarks, HOME};
 use mandelbrot::flight::{self, Flight};
-use mandelbrot::policy::{MIN_DECISION_SAMPLES, Policy};
+use mandelbrot::policy::{MIN_DECISION_SAMPLES, Policy, Settings};
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Renderer};
 
@@ -80,7 +80,7 @@ impl App {
             renderer: None,
             explorer: Explorer::new(1, 1),
             modifiers: ModifiersState::empty(),
-            scheduler: Scheduler::default(),
+            scheduler: Scheduler::with_policy(Policy::new(Settings::tuned())),
             bookmarks: Bookmarks::with_presets(),
             flight: None,
             flight_speed: flight::DEFAULT_SPEED,
@@ -442,7 +442,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
     if let Some(n) = iters {
         explorer.set_iter_limit(n);
     }
-    let mut policy = Policy::master();
+    let mut policy = Policy::new(Settings::tuned());
     for event in explorer.take_inputs() {
         policy.input(event);
     }

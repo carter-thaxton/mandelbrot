@@ -89,6 +89,9 @@ pub struct Settings {
     /// Adjacent samples whose mu differ by more than this count as rough
     /// (see `TileStats::rough`).
     pub rough_mu: f32,
+    /// The shrink rule's measure of the slowest escapes: this quantile of
+    /// the escaped samples' iteration counts. 1: the single slowest sample.
+    pub shrink_quantile: f64,
 }
 
 impl Settings {
@@ -102,7 +105,18 @@ impl Settings {
             iters_per_zoom: ITERS_PER_ZOOM,
             max_predicted_growth: MAX_PREDICTED_GROWTH,
             rough_mu: DEFAULT_ROUGH_MU,
+            shrink_quantile: 1.0,
         }
+    }
+
+    /// Master with improved tuning (what the app uses):
+    /// - The shrink rule ignores the slowest 0.05% of escapes. Around the
+    ///   set's boundary a few pixels always escape very late, so the single
+    ///   slowest one kept the limit high long after zooming out (18k at the
+    ///   home view). Half the grow rule's 0.1%, so a shrink can't trigger a
+    ///   regrowth.
+    pub fn tuned() -> Self {
+        Self { shrink_quantile: 0.9995, ..Self::master() }
     }
 }
 
@@ -339,7 +353,8 @@ impl Policy {
     /// - If even the slowest escaping sample used less than a third of the
     ///   limit, the extra iterations only cost time on interior pixels: shrink
     ///   to 2x that sample. That leaves the top quarter empty, so the two
-    ///   rules don't oscillate.
+    ///   rules don't oscillate. (With a shrink_quantile below 1, "the
+    ///   slowest" is that quantile of the escape counts instead.)
     pub fn judge(&mut self, s: &FrameStats) -> bool {
         if !self.auto || s.samples < MIN_DECISION_SAMPLES {
             return false;
@@ -348,10 +363,15 @@ impl Policy {
         let escaped = s.samples.saturating_sub(s.interior as u64);
         let cut_off = s.near_limit >= 4 && s.near_limit as f64 > escaped as f64 * 1e-3;
         let all_black = s.max_escaped == 0 && s.interior > 0;
+        let slowest = if self.settings.shrink_quantile >= 1.0 {
+            s.max_escaped
+        } else {
+            s.escapes.quantile(self.settings.shrink_quantile).map_or(s.max_escaped, |q| q.min(s.max_escaped))
+        };
         let new = if cut_off || all_black {
             l.saturating_mul(2)
-        } else if s.max_escaped < l / 3 {
-            s.max_escaped.saturating_mul(2)
+        } else if slowest < l / 3 {
+            slowest.saturating_mul(2)
         } else {
             l
         }
@@ -496,7 +516,7 @@ mod tests {
     use super::*;
 
     fn stats(samples: u64, max_escaped: u32, near_limit: u32, interior: u32) -> FrameStats {
-        FrameStats { gpu_ms: 0.0, samples, max_escaped, near_limit, interior }
+        FrameStats { gpu_ms: 0.0, samples, max_escaped, near_limit, interior, ..Default::default() }
     }
 
     fn with_limit(limit: u32) -> Policy {
@@ -530,6 +550,26 @@ mod tests {
         // Manual mode ignores stats.
         p.input(Input::ScaleDetail(2.0));
         assert!(!p.judge(&stats(100_000, 1, 0, 0)));
+    }
+
+    #[test]
+    fn tuned_shrink_ignores_the_slowest_few_escapes() {
+        // 100k escaped samples, all fast but 20 that are very slow.
+        let mut s = stats(100_000, 6000, 0, 0);
+        for _ in 0..99_980 {
+            s.escapes.record(300);
+        }
+        for _ in 0..20 {
+            s.escapes.record(6000);
+        }
+        // Master keeps the limit for the slowest sample...
+        let mut master = with_limit(20_000);
+        assert!(master.judge(&s));
+        assert_eq!(master.ceiling(), 12_000);
+        // ...tuned shrinks to 2x the 99.95th percentile (the bin edge above 300).
+        let mut tuned = Policy { limit: 20_000, ..Policy::new(Settings::tuned()) };
+        assert!(tuned.judge(&s));
+        assert_eq!(tuned.ceiling(), 2 * 305);
     }
 
     #[test]
@@ -582,6 +622,7 @@ mod tests {
             max_escaped,
             near_limit,
             interior: 10,
+            ..Default::default()
         };
         assert!(!sweep.add(&stats(50, 1), &[0, 1]));
         assert!(!sweep.add(&stats(70, 2), &[1, 2]), "tile 1 twice must not count double");

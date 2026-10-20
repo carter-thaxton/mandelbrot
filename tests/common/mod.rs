@@ -46,7 +46,7 @@ impl MockRenderer {
 }
 
 pub fn stats(samples: u64, max_escaped: u32, near_limit: u32, interior: u32) -> FrameStats {
-    FrameStats { gpu_ms: 0.0, samples, max_escaped, near_limit, interior }
+    FrameStats { gpu_ms: 0.0, samples, max_escaped, near_limit, interior, ..Default::default() }
 }
 
 impl Renderer for MockRenderer {
