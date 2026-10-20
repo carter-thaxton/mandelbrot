@@ -289,11 +289,6 @@ impl Recorder<'_> {
         h.u64(b.tiles.len() as u64);
         for t in &b.tiles {
             h.u64(((t.origin[0] as u64) << 32) | t.origin[1] as u64);
-            // Only a limit other than the frame's (so runs from before
-            // per-tile limits hash the same).
-            if t.max_iter != p.max_iter {
-                h.u64(t.max_iter as u64);
-            }
         }
     }
 }

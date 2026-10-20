@@ -28,9 +28,8 @@
 //!   - A *sweep*: batches accumulated until every tile has been computed for
 //!     the current view and limit (full-resolution evidence once settled).
 //!
-//! The direction (see the design doc) is per-tile limits steered by each
-//! tile's statistics, with the frame-wide limit reduced to what the
-//! reference orbit must cover ([`Policy::ceiling`]).
+//! Every tile is computed to one frame-wide limit ([`Policy::ceiling`]):
+//! per-tile limits made tile edges visible.
 
 use std::time::{Duration, Instant};
 
@@ -210,8 +209,8 @@ pub enum Plan {
     /// Gather statistics for the whole view at this step; write no pixels.
     Probe { step: u32 },
     /// Compute these tiles (indices into [`PlanInput::tiles`]) at this step,
-    /// each to its own limit.
-    Draw { tiles: Vec<usize>, step: u32, limits: Vec<u32> },
+    /// to the limit [`Policy::ceiling`].
+    Draw { tiles: Vec<usize>, step: u32 },
 }
 
 /// Statistics accumulated until every tile has been computed once.
@@ -416,10 +415,7 @@ impl Policy {
             return Plan::Probe { step: self.preview_step(input).max(s.probe_min_step) };
         }
         match self.pick(input) {
-            Some((tiles, step)) => {
-                let limits = vec![self.limit; tiles.len()];
-                Plan::Draw { tiles, step, limits }
-            }
+            Some((tiles, step)) => Plan::Draw { tiles, step },
             None => Plan::Idle,
         }
     }
@@ -646,9 +642,8 @@ mod tests {
         let p = Policy::master();
         let mut tiles = canvas();
         // Nothing there yet: everything fits the budget at full resolution.
-        let Plan::Draw { tiles: picked, step, limits } = p.plan(&input(&tiles, Change::Fresh)) else { panic!() };
+        let Plan::Draw { tiles: picked, step } = p.plan(&input(&tiles, Change::Fresh)) else { panic!() };
         assert_eq!((picked.len(), step), (8, 1));
-        assert!(limits.iter().all(|&l| l == p.ceiling()));
         // Present at full resolution but inexact (as after a small zoom
         // within the preview step): refine them, nearest the center first.
         for t in &mut tiles {

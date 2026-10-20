@@ -40,17 +40,11 @@ pub enum Output {
 pub struct TileJob {
     /// Top-left pixel (multiples of [`TILE`]).
     pub origin: [u32; 2],
-    /// Iteration limit for this tile's samples, at most
-    /// [`FrameParams::max_iter`] (the reference orbit and the series skip
-    /// are sized for that). A limit at or below the series skip leaves the
-    /// tile's samples unescaped.
-    pub max_iter: u32,
-    _pad: u32,
 }
 
 impl TileJob {
-    pub fn new(origin: [u32; 2], max_iter: u32) -> Self {
-        Self { origin, max_iter, _pad: 0 }
+    pub fn new(origin: [u32; 2]) -> Self {
+        Self { origin }
     }
 }
 
@@ -76,10 +70,10 @@ impl TileBatch {
         Self { tiles, step, output, rough_mu: DEFAULT_ROUGH_MU }
     }
 
-    /// Every tile of a `width` x `height` canvas, all with limit `max_iter`.
-    pub fn all(width: u32, height: u32, max_iter: u32, step: u32, output: Output) -> Self {
+    /// Every tile of a `width` x `height` canvas.
+    pub fn all(width: u32, height: u32, step: u32, output: Output) -> Self {
         let tiles = (0..height.div_ceil(TILE))
-            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| TileJob::new([tx * TILE, ty * TILE], max_iter)))
+            .flat_map(|ty| (0..width.div_ceil(TILE)).map(move |tx| TileJob::new([tx * TILE, ty * TILE])))
             .collect();
         Self::new(tiles, step, output)
     }
@@ -105,9 +99,9 @@ pub struct TileStats {
     /// Highest iteration count among escaped samples.
     pub max_escaped: u32,
     /// Sum of the escaped samples' iteration counts. With `interior` times
-    /// the tile's limit, what the tile cost.
+    /// the iteration limit, what the tile cost.
     pub escaped_iters: u32,
-    /// Escaped samples that needed more than 3/4 of the tile's limit.
+    /// Escaped samples that needed more than 3/4 of the iteration limit.
     pub near_limit: u32,
     /// Samples that never escaped.
     pub interior: u32,
@@ -215,7 +209,7 @@ pub struct FrameStats {
     pub samples: u64,
     /// Highest iteration count among escaped samples.
     pub max_escaped: u32,
-    /// Escaped samples that needed more than 3/4 of their tile's limit.
+    /// Escaped samples that needed more than 3/4 of the iteration limit.
     pub near_limit: u32,
     /// Samples that never escaped (in the set, or under-iterated).
     pub interior: u32,
@@ -316,6 +310,7 @@ pub struct GpuParams {
     pub sa_a_e: i32,
     /// See [`TileBatch::rough_mu`].
     pub rough_mu: f32,
+    pub max_iter: u32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -350,6 +345,7 @@ impl GpuParams {
             sa_a_m: p.series_a.0,
             sa_a_e: p.series_a.1,
             rough_mu: batch.rough_mu,
+            max_iter: p.max_iter,
             stats_only: (batch.output == Output::StatsOnly) as u32,
         }
     }
@@ -389,7 +385,8 @@ mod tests {
         assert_eq!(offset_of!(GpuParams, ref_off_m), 56);
         assert_eq!(offset_of!(GpuParams, sa_a_m), 72);
         assert_eq!(offset_of!(GpuParams, rough_mu), 84);
-        assert_eq!(size_of::<GpuParams>(), 88);
+        assert_eq!(offset_of!(GpuParams, max_iter), 88);
+        assert_eq!(size_of::<GpuParams>(), 96);
     }
 
     #[test]
@@ -436,11 +433,10 @@ mod tests {
         assert_eq!(TileStats::pairs_in(0, 5), 0);
     }
 
-    /// `TileJob` is read by the shader as { uint2 origin; uint max_iter; uint _pad; }.
+    /// `TileJob` is read by the shader as { uint2 origin; }.
     #[test]
     fn tile_job_layout_matches_the_shader() {
         assert_eq!(offset_of!(TileJob, origin), 0);
-        assert_eq!(offset_of!(TileJob, max_iter), 8);
-        assert_eq!(size_of::<TileJob>(), 16);
+        assert_eq!(size_of::<TileJob>(), 8);
     }
 }

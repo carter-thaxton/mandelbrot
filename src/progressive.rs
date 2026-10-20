@@ -271,12 +271,12 @@ impl Scheduler {
                 if stale {
                     present(renderer, &mut self.presented)?;
                 }
-                let mut probe = TileBatch::all(input.width, input.height, params.max_iter, *step, Output::StatsOnly);
+                let mut probe = TileBatch::all(input.width, input.height, *step, Output::StatsOnly);
                 probe.rough_mu = self.policy.settings().rough_mu;
                 Some(renderer.draw(&params, &probe)?)
             }
-            Plan::Draw { tiles, step, limits } => {
-                let jobs = tiles.iter().zip(limits).map(|(&i, &l)| TileJob::new(input.tiles[i].origin, l)).collect();
+            Plan::Draw { tiles, step } => {
+                let jobs = tiles.iter().map(|&i| TileJob::new(input.tiles[i].origin)).collect();
                 let batch = TileBatch { rough_mu: self.policy.settings().rough_mu, ..TileBatch::new(jobs, *step, Output::Pixels) };
                 let stats = renderer.draw(&params, &batch)?;
                 present(renderer, &mut self.presented)?;
@@ -288,11 +288,11 @@ impl Scheduler {
         }
         self.policy.observe(&input, &plan, stats.as_ref());
 
-        if let (Plan::Draw { tiles, step, limits }, Some(s)) = (&plan, &stats) {
+        if let (Plan::Draw { tiles, step }, Some(s)) = (&plan, &stats) {
             let canvas = self.canvas.as_mut().unwrap();
-            for ((&i, &limit), tile_stats) in tiles.iter().zip(limits).zip(&s.tiles) {
+            for (&i, tile_stats) in tiles.iter().zip(&s.tiles) {
                 let t = &mut canvas.tiles[i];
-                *t = TileState { res: *step as f32, exact: *step == 1, limit, stats: Some(*tile_stats), ..*t };
+                *t = TileState { res: *step as f32, exact: *step == 1, limit: params.max_iter, stats: Some(*tile_stats), ..*t };
             }
         }
         // A changed limit shows up as a new look on the next step.

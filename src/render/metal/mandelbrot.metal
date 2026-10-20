@@ -31,13 +31,12 @@ struct Params {
     float2 sa_a_m;     // ...with dz = A * dc, A as complex floatexp
     int    sa_a_e;
     float  rough_mu;   // neighbors whose mu differ by more than this are rough
+    uint   max_iter;
 };
 
 // One tile to compute. Must match `TileJob` in src/render/mod.rs.
 struct TileJob {
-    uint2 origin;   // top-left pixel
-    uint  max_iter; // iteration limit for this tile (at most the frame's, which the reference covers)
-    uint  _pad;
+    uint2 origin; // top-left pixel
 };
 
 /// Canvas value for samples that never escaped (in the set, or not computed).
@@ -50,7 +49,7 @@ constant uint TILE = 16; // must match TILE in src/render/mod.rs
 struct TileStats {
     uint max_escaped;   // highest iteration count among escaped samples
     uint escaped_iters; // sum of the escaped samples' iteration counts
-    uint near_limit;    // escaped samples needing > 3/4 of the tile's limit
+    uint near_limit;    // escaped samples needing > 3/4 of max_iter
     uint interior;      // samples that never escaped
     uint rough;         // adjacent pairs, both escaped, mu differing > rough_mu
     uint edge;          // adjacent pairs where exactly one sample escaped
@@ -406,7 +405,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
     // Grid: (TILE/step, TILE/step, tile count). Each thread computes one
     // sample at the center of a step x step block within its tile.
     TileJob job = tiles[gid.z];
-    uint max_iter = job.max_iter;
+    uint max_iter = p.max_iter;
     uint x0 = job.origin.x + gid.x * p.step;
     uint y0 = job.origin.y + gid.y * p.step;
     // No early return: every thread must take part in the SIMD reductions.

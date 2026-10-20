@@ -153,7 +153,6 @@ impl MetalRenderer {
         if batch.tiles.is_empty() {
             return Ok(vec![]);
         }
-        debug_assert!(batch.tiles.iter().all(|t| t.max_iter <= params.max_iter), "tile limit above the frame's");
         let gpu = GpuParams::new(params, batch);
         let per_side = (TILE / gpu.step) as usize;
         let reference = self.reference_buffer(params)?;
@@ -397,7 +396,7 @@ impl Renderer for MetalRenderer {
         let (w, h) = (params.width as usize, params.height as usize);
         let mu = self.new_texture(w, h, CANVAS_FORMAT, false)?;
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
-        let batch = TileBatch::all(params.width, params.height, params.max_iter, step, Output::Pixels);
+        let batch = TileBatch::all(params.width, params.height, step, Output::Pixels);
         let grids = self.encode(&cmd, &mu, params, &batch)?;
         let stats = self.finish(&cmd, &grids)?.total;
         Ok((self.colorized_rgba(&mu, colors)?, stats))
