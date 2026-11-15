@@ -2,7 +2,7 @@
 //! perturbation reference orbit's lifecycle. Input that affects iteration
 //! depth is queued for the policy (see `policy.rs`).
 //!
-//! Nothing in here knows about Metal, AppKit, or even winit. Input is fed in as
+//! Nothing in here knows about Metal, wgpu, AppKit, or even winit. Input is fed in as
 //! plain numbers (physical pixels), and the output is a [`FrameParams`] that any
 //! renderer backend can consume.
 

@@ -18,5 +18,11 @@ objc2-metal = "0.3.2"
 objc2-quartz-core = "0.3.2"
 objc2-app-kit = "0.3.2"
 
+# Every other platform renders through wgpu (Vulkan on Linux), used only
+# from `src/render/wgpu/`.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = "30.0.1"
+pollster = "1.0.1"
+
 [profile.release]
 debug = 1

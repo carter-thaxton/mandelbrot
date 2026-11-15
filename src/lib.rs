@@ -6,7 +6,7 @@
 //! - [`progressive`]: schedules GPU work into budget-sized, reusable tiles
 //! - [`policy`]: decides that work and its iteration limits
 //! - [`render`]: the backend-agnostic [`render::Renderer`] interface and the
-//!   Metal backend
+//!   backends (Metal on macOS, wgpu/Vulkan elsewhere)
 //! - [`bookmarks`], [`flight`]: saved places and smooth zoom-and-pan flights
 //!   between them
 //! - [`harness`]: scripted scenarios for measuring and comparing the

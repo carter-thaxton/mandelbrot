@@ -32,6 +32,7 @@ struct Params {
     int    sa_a_e;
     float  rough_mu;   // neighbors whose mu differ by more than this are rough
     uint   max_iter;
+    float  one;        // 1.0; only the WGSL port uses it (see GpuParams)
 };
 
 // One tile to compute. Must match `TileJob` in src/render/mod.rs.
@@ -45,7 +46,7 @@ constant float INSIDE = -1.0;
 constant uint TILE = 16; // must match TILE in src/render/mod.rs
 
 // Statistics for one tile of a batch. Must match `GpuTileStats` in
-// render/metal/mod.rs.
+// src/render/mod.rs.
 struct TileStats {
     uint max_escaped;   // highest iteration count among escaped samples
     uint escaped_iters; // sum of the escaped samples' iteration counts
@@ -536,7 +537,7 @@ kernel void mandelbrot(texture2d<float, access::write> out [[texture(0)]],
 // old image serves as the preview and only new or stale tiles are recomputed.
 // ---------------------------------------------------------------------------
 
-// Must match `GpuReprojection` in render/metal/mod.rs.
+// Must match `GpuReprojection` in src/render/mod.rs.
 struct Reprojection {
     float  ratio;      // new pixel size in old pixels
     float  _pad;
@@ -587,7 +588,7 @@ kernel void reproject(texture2d<float, access::read>  src [[texture(0)]],
 // palette lookup per pixel), so colors can change every frame for free.
 // ---------------------------------------------------------------------------
 
-// Must match `GpuColors` in render/metal/mod.rs.
+// Must match `GpuColors` in src/render/mod.rs.
 struct Colors {
     uint  palette;
     float density;   // palette cycles per 50 iterations

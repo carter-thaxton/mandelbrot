@@ -5,7 +5,7 @@
 //! Also holds an ignored measurement, `simulated_deep_zoom`:
 //! `cargo test --release --test gpu simulated_deep_zoom -- --ignored --nocapture`
 
-use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place};
+use mandelbrot::app::{Colors, Explorer, PALETTE_COUNT, PALETTE_PERIOD, Place, Precision, PrecisionMode};
 use mandelbrot::bookmarks::PRESETS;
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Output, Renderer, TILE, TileBatch, TileJob, TileStats};
@@ -14,7 +14,7 @@ const SEAHORSE: (&str, &str) = ("-0.743643887037158704752191506114774", "0.13182
 
 /// A headless renderer with a `width` x `height` canvas.
 fn renderer(width: u32, height: u32) -> Box<dyn Renderer> {
-    let mut r = render::create_headless().expect("Metal device");
+    let mut r = render::create_headless().expect("GPU device");
     r.resize(width, height, 1.0);
     r
 }
@@ -38,7 +38,7 @@ fn run_to_completion(s: &mut Scheduler, e: &mut Explorer, r: &mut dyn Renderer) 
 /// panning) must match rendering against a fresh centered one.
 #[test]
 fn off_center_reference_matches_fresh() {
-    let mut r = render::create_headless().expect("Metal device");
+    let mut r = render::create_headless().expect("GPU device");
     for zoom in [1e8, 1e40] {
         // c = i: a boundary point with smooth surroundings at every depth, so
         // any offset error shows up as a visibly shifted image.
@@ -257,7 +257,7 @@ fn black_and_colors(rgba: &[u8]) -> (f64, usize) {
 /// escaping, as a bug near nuclei once caused).
 #[test]
 fn presets_render_structure() {
-    let mut r = render::create_headless().expect("Metal device");
+    let mut r = render::create_headless().expect("GPU device");
     for p in &PRESETS {
         let mut e = Explorer::new(240, 160);
         e.go_to(&Place::parse(p.x, p.y, p.span).unwrap());
@@ -275,7 +275,7 @@ fn presets_render_structure() {
 #[test]
 fn series_skip_and_full_iteration_agree_near_a_nucleus() {
     let star = PRESETS.iter().find(|p| p.name == "six-armed star").unwrap();
-    let mut r = render::create_headless().expect("Metal device");
+    let mut r = render::create_headless().expect("GPU device");
     for span in [1e-63, 1e-75] {
         let mut images = vec![];
         for skip in [true, false] {
@@ -290,6 +290,28 @@ fn series_skip_and_full_iteration_agree_near_a_nucleus() {
         let d = differing(&images[0], &images[1]);
         assert!(d < 0.01, "span {span:e}: {:.2}% of pixels differ", d * 100.0);
     }
+}
+
+/// Double-float must really carry ~48 bits: deep enough that f32 is
+/// hopeless, it must agree with perturbation. (A shader compiler that
+/// simplifies its error terms away silently reduces it to f32.)
+#[test]
+fn double_float_matches_perturbation_at_depth() {
+    let mut r = render::create_headless().expect("GPU device");
+    let mut images = vec![];
+    for precision in [Precision::DoubleFloat, Precision::Perturbation] {
+        // c = i: smooth surroundings at every depth (see above).
+        let mut e = Explorer::new(240, 160);
+        e.set_center_str("0", "1");
+        e.zoom_at_center(1e10);
+        e.set_iter_limit(3000);
+        e.precision_mode = PrecisionMode::Forced(precision);
+        let params = e.frame_params();
+        assert_eq!(params.precision, precision);
+        images.push(r.capture(&params, 1, &e.colors()).unwrap().0);
+    }
+    let d = differing(&images[0], &images[1]);
+    assert!(d < 0.01, "{:.2}% of pixels differ", d * 100.0);
 }
 
 /// Simulated continuous pinch-zoom through the seahorse valley, printing the

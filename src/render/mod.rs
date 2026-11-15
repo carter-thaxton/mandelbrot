@@ -1,8 +1,9 @@
 //! Backend-agnostic rendering interface.
 //!
-//! The app talks only to [`Renderer`]. Each backend (currently Metal) lives in
-//! its own submodule and is selected by [`create`]. A future `wgpu` backend
-//! would implement the same trait and reuse [`GpuParams`] as its uniform.
+//! The app talks only to [`Renderer`]. Each backend lives in its own
+//! submodule and is selected by [`create`]: Metal on macOS, wgpu (Vulkan on
+//! Linux) everywhere else. Both share the GPU-facing layouts defined here
+//! ([`GpuParams`] and friends), which their shaders must match.
 //!
 //! Renderers own a persistent *canvas* the size of the window, divided into
 //! [`TILE`]-pixel square tiles. It holds each pixel's smooth iteration count
@@ -19,8 +20,17 @@ use crate::perturb::{complex_floatexp, frexp};
 
 #[cfg(target_os = "macos")]
 mod metal;
+#[cfg(not(target_os = "macos"))]
+mod wgpu;
 
 pub type Result<T> = std::result::Result<T, String>;
+
+/// Name of the platform's backend (what [`create`] and [`create_headless`]
+/// make), for anything kept per backend, like recorded fingerprints.
+#[cfg(target_os = "macos")]
+pub const BACKEND: &str = "metal";
+#[cfg(not(target_os = "macos"))]
+pub const BACKEND: &str = "wgpu";
 
 /// Canvas tile edge in pixels. Must match TILE in the shader.
 pub const TILE: u32 = 16;
@@ -261,8 +271,7 @@ pub fn create<W: HasWindowHandle + HasDisplayHandle>(window: &W) -> Result<Box<d
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = window;
-        Err("no renderer backend for this platform yet".into())
+        Ok(Box::new(wgpu::WgpuRenderer::new(Some(window))?))
     }
 }
 
@@ -274,7 +283,7 @@ pub fn create_headless() -> Result<Box<dyn Renderer>> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("no renderer backend for this platform yet".into())
+        Ok(Box::new(wgpu::WgpuRenderer::new(None::<&NoWindow>)?))
     }
 }
 
@@ -311,6 +320,11 @@ pub struct GpuParams {
     /// See [`TileBatch::rough_mu`].
     pub rough_mu: f32,
     pub max_iter: u32,
+    /// Always 1.0: a value shader compilers can't know, used by the WGSL
+    /// shader to stop them from optimizing df64's error terms away (see
+    /// `hide` there; Metal's safe math mode doesn't need it). Also makes the
+    /// trailing padding explicit, so the struct can be uploaded as bytes.
+    pub one: f32,
 }
 
 fn split_f64(v: f64) -> [f32; 2] {
@@ -347,19 +361,108 @@ impl GpuParams {
             rough_mu: batch.rough_mu,
             max_iter: p.max_iter,
             stats_only: (batch.output == Output::StatsOnly) as u32,
+            one: 1.0,
         }
     }
 }
 
+/// Layout of `Reprojection` in the shaders.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuReprojection {
+    pub ratio: f32,
+    pub _pad: f32,
+    pub shift: [f32; 2],
+    pub old_w: u32,
+    pub old_h: u32,
+}
+
+impl GpuReprojection {
+    pub fn new(xf: &Reprojection) -> Self {
+        Self {
+            ratio: xf.ratio as f32,
+            _pad: 0.0,
+            shift: [xf.shift.0 as f32, xf.shift.1 as f32],
+            old_w: xf.old_size.0,
+            old_h: xf.old_size.1,
+        }
+    }
+}
+
+/// Layout of `Colors` in the shaders.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GpuColors {
+    pub palette: u32,
+    pub density: f32,
+    pub offset: f32,
+    pub _pad: u32,
+}
+
+impl GpuColors {
+    pub fn new(c: &Colors) -> Self {
+        Self { palette: c.palette, density: c.density, offset: c.offset, _pad: 0 }
+    }
+}
+
+/// Layout of one entry of the kernel's per-tile stats buffer, `TileStats`
+/// in the shaders; see [`TileStats`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GpuTileStats {
+    pub max_escaped: u32,
+    pub escaped_iters: u32,
+    pub near_limit: u32,
+    pub interior: u32,
+    pub rough: u32,
+    pub edge: u32,
+    pub _pad: [u32; 2],
+}
+
+impl GpuTileStats {
+    /// The public stats for a tile with a `w` x `h` grid of samples.
+    pub fn to_tile_stats(self, [w, h]: [u32; 2]) -> TileStats {
+        TileStats {
+            samples: w * h,
+            max_escaped: self.max_escaped,
+            escaped_iters: self.escaped_iters,
+            near_limit: self.near_limit,
+            interior: self.interior,
+            pairs: TileStats::pairs_in(w, h),
+            rough: self.rough,
+            edge: self.edge,
+        }
+    }
+}
+
+/// Each tile's grid of samples inside a `width` x `height` canvas at `step`
+/// (edge tiles may be partial).
+pub(crate) fn sample_grids(tiles: &[TileJob], width: u32, height: u32, step: u32) -> Vec<[u32; 2]> {
+    tiles
+        .iter()
+        .map(|t| {
+            let w = TILE.min(width.saturating_sub(t.origin[0])).div_ceil(step);
+            let h = TILE.min(height.saturating_sub(t.origin[1])).div_ceil(step);
+            [w, h]
+        })
+        .collect()
+}
+
 /// Uninhabited placeholder so `create_headless` can name a window type.
-#[cfg(target_os = "macos")]
 pub(crate) enum NoWindow {}
 
-#[cfg(target_os = "macos")]
 impl HasWindowHandle for NoWindow {
     fn window_handle(
         &self,
     ) -> std::result::Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+        match *self {}
+    }
+}
+
+impl HasDisplayHandle for NoWindow {
+    fn display_handle(
+        &self,
+    ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError> {
         match *self {}
     }
 }
@@ -386,7 +489,18 @@ mod tests {
         assert_eq!(offset_of!(GpuParams, sa_a_m), 72);
         assert_eq!(offset_of!(GpuParams, rough_mu), 84);
         assert_eq!(offset_of!(GpuParams, max_iter), 88);
+        assert_eq!(offset_of!(GpuParams, one), 92);
         assert_eq!(size_of::<GpuParams>(), 96);
+    }
+
+    /// The other uniforms and the stats entry are uploaded and read back as
+    /// raw bytes, so they must have no implicit padding.
+    #[test]
+    fn shared_layouts_have_no_hidden_padding() {
+        assert_eq!(size_of::<GpuReprojection>(), 24);
+        assert_eq!(offset_of!(GpuReprojection, shift), 8);
+        assert_eq!(size_of::<GpuColors>(), 16);
+        assert_eq!(size_of::<GpuTileStats>(), 32);
     }
 
     #[test]

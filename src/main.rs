@@ -14,6 +14,15 @@ use mandelbrot::policy::{MIN_DECISION_SAMPLES, Policy, Settings};
 use mandelbrot::progressive::Scheduler;
 use mandelbrot::render::{self, Renderer};
 
+/// The command-key modifier: cmd on macOS, ctrl elsewhere (where window
+/// managers tend to keep the super key for themselves).
+const COMMAND: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
+
+/// HELP with the platform's command key.
+fn help() -> String {
+    HELP.replace("cmd+", &format!("{COMMAND}+"))
+}
+
 const HELP: &str = "\
 Mandelbrot explorer
   drag / cmd+two-finger      pan
@@ -45,8 +54,10 @@ Headless: mandelbrot --capture out.png [--size WxH] [--center X,Y] [--zoom Z] [-
           [--density D] [--precision f32|df|perturb] [--no-skip]";
 
 struct App {
-    window: Option<Window>,
+    /// Declared (so dropped) before `window`: it may hold a surface that
+    /// borrows the window.
     renderer: Option<Box<dyn Renderer>>,
+    window: Option<Window>,
     explorer: Explorer,
     modifiers: ModifiersState,
     scheduler: Scheduler,
@@ -100,9 +111,14 @@ impl App {
         self.request_redraw();
     }
 
+    /// Whether the command key ([`COMMAND`]) is held.
+    fn command_key(&self) -> bool {
+        if cfg!(target_os = "macos") { self.modifiers.super_key() } else { self.modifiers.control_key() }
+    }
+
     /// Number keys: save (cmd), jump (shift), or fly to a place.
     fn handle_slot(&mut self, slot: u8) {
-        if self.modifiers.super_key() {
+        if self.command_key() {
             if self.bookmarks.save(slot, self.explorer.place()) {
                 println!("saved place {slot}");
             } else {
@@ -115,7 +131,7 @@ impl App {
         } else if let Some(place) = self.bookmarks.get(slot) {
             place.clone()
         } else {
-            println!("nothing saved in {slot} yet (cmd+{slot} saves the current place)");
+            println!("nothing saved in {slot} yet ({COMMAND}+{slot} saves the current place)");
             return;
         };
         if self.modifiers.shift_key() {
@@ -152,6 +168,7 @@ impl App {
         if navigates {
             self.flight = None;
         }
+        let command = self.command_key();
         let e = &mut self.explorer;
         match key {
             Key::Named(NamedKey::Space) => match &mut self.flight {
@@ -174,7 +191,7 @@ impl App {
             Key::Named(NamedKey::ArrowDown) => e.pan_fraction(0.0, -0.1),
             Key::Character(s) => match s.as_str() {
                 "q" | "Q" => event_loop.exit(),
-                "w" | "W" if self.modifiers.super_key() => event_loop.exit(),
+                "w" | "W" if command => event_loop.exit(),
                 "=" => e.zoom_at_center(2.0),
                 "-" => e.zoom_at_center(0.5),
                 "+" => return self.set_flight_speed(1.5),
@@ -425,7 +442,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
                     _ => PrecisionMode::Auto,
                 }
             }
-            other => return Err(format!("unknown argument {other}\n\n{HELP}")),
+            other => return Err(format!("unknown argument {other}\n\n{}", help())),
         }
     }
     let path = path.ok_or("missing --capture path")?;
@@ -480,7 +497,7 @@ fn run_capture(args: &[String]) -> render::Result<()> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{HELP}");
+        println!("{}", help());
         return;
     }
     if !args.is_empty() {
@@ -491,7 +508,7 @@ fn main() {
         return;
     }
 
-    println!("{HELP}");
+    println!("{}", help());
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.run_app(&mut App::new()).expect("event loop failed");
 }

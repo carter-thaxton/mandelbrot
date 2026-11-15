@@ -28,7 +28,10 @@ use objc2_metal::{
 use objc2_quartz_core::{CAAutoresizingMask, CAMetalDrawable, CAMetalLayer};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-use super::{BatchStats, ESCAPE_BINS, EscapeHistogram, FrameStats, GpuParams, Output, Renderer, Reprojection, Result, TILE, TileBatch, TileStats};
+use super::{
+    BatchStats, ESCAPE_BINS, EscapeHistogram, FrameStats, GpuColors, GpuParams, GpuReprojection, GpuTileStats, Output,
+    Renderer, Reprojection, Result, TILE, TileBatch, sample_grids,
+};
 use crate::app::{Colors, FrameParams};
 use crate::perturb::ReferenceOrbit;
 
@@ -40,41 +43,8 @@ type Texture = ProtocolObject<dyn MTLTexture>;
 type CommandBuffer = ProtocolObject<dyn MTLCommandBuffer>;
 type Pipeline = ProtocolObject<dyn MTLComputePipelineState>;
 
-/// Layout of `Reprojection` in the shader.
-#[repr(C)]
-struct GpuReprojection {
-    ratio: f32,
-    _pad: f32,
-    shift: [f32; 2],
-    old_w: u32,
-    old_h: u32,
-}
-
-/// Layout of `Colors` in the shader.
-#[repr(C)]
-struct GpuColors {
-    palette: u32,
-    density: f32,
-    offset: f32,
-    _pad: u32,
-}
-
 /// The canvas format: one f32 of smooth iteration count per pixel.
 const CANVAS_FORMAT: MTLPixelFormat = MTLPixelFormat::R32Float;
-
-/// Layout of one entry of the kernel's per-tile stats buffer (buffer 2),
-/// `TileStats` in the shader; see [`TileStats`].
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct GpuTileStats {
-    max_escaped: u32,
-    escaped_iters: u32,
-    near_limit: u32,
-    interior: u32,
-    rough: u32,
-    edge: u32,
-    _pad: [u32; 2],
-}
 
 pub struct MetalRenderer {
     device: Retained<Device>,
@@ -210,16 +180,7 @@ impl MetalRenderer {
             MTLSize { width: per_side, height: per_side, depth },
         );
         enc.endEncoding();
-        let step = gpu.step;
-        Ok(batch
-            .tiles
-            .iter()
-            .map(|t| {
-                let w = TILE.min(params.width.saturating_sub(t.origin[0])).div_ceil(step);
-                let h = TILE.min(params.height.saturating_sub(t.origin[1])).div_ceil(step);
-                [w, h]
-            })
-            .collect())
+        Ok(sample_grids(&batch.tiles, params.width, params.height, gpu.step))
     }
 
     /// Wait for `cmd` and collect timing plus the kernel's statistics for
@@ -234,20 +195,7 @@ impl MetalRenderer {
         }
         // SAFETY: the GPU has finished, having written one entry per tile.
         let gpu = unsafe { std::slice::from_raw_parts(self.tile_stats.contents().cast::<GpuTileStats>().as_ptr(), grids.len()) };
-        let tiles = gpu
-            .iter()
-            .zip(grids)
-            .map(|(s, &[w, h])| TileStats {
-                samples: w * h,
-                max_escaped: s.max_escaped,
-                escaped_iters: s.escaped_iters,
-                near_limit: s.near_limit,
-                interior: s.interior,
-                pairs: TileStats::pairs_in(w, h),
-                rough: s.rough,
-                edge: s.edge,
-            })
-            .collect();
+        let tiles = gpu.iter().zip(grids).map(|(s, &grid)| s.to_tile_stats(grid)).collect();
         let mut stats = BatchStats::of_tiles((cmd.GPUEndTime() - cmd.GPUStartTime()) * 1000.0, tiles);
         // SAFETY: the GPU has finished writing the histogram.
         stats.total.escapes = EscapeHistogram(unsafe { self.escapes.contents().cast::<[u32; ESCAPE_BINS]>().read() });
@@ -268,7 +216,7 @@ impl MetalRenderer {
 
     /// Encode coloring the mu texture `mu` into `out` (sized as `out`).
     fn encode_colorize(&self, cmd: &CommandBuffer, mu: &Texture, out: &Texture, colors: &Colors) -> Result<()> {
-        let gpu = GpuColors { palette: colors.palette, density: colors.density, offset: colors.offset, _pad: 0 };
+        let gpu = GpuColors::new(colors);
         let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
         enc.setComputePipelineState(&self.colorize_pipeline);
         // SAFETY: textures 0/1 and buffer 0 match the `colorize` kernel, and
@@ -327,13 +275,7 @@ impl Renderer for MetalRenderer {
         let (Some(canvas), Some(spare)) = (self.canvas.clone(), self.spare.clone()) else {
             return Err("reproject() before resize()".into());
         };
-        let gpu = GpuReprojection {
-            ratio: xf.ratio as f32,
-            _pad: 0.0,
-            shift: [xf.shift.0 as f32, xf.shift.1 as f32],
-            old_w: xf.old_size.0,
-            old_h: xf.old_size.1,
-        };
+        let gpu = GpuReprojection::new(xf);
         let cmd = self.queue.commandBuffer().ok_or("failed to create command buffer")?;
         let enc = cmd.computeCommandEncoder().ok_or("failed to create compute encoder")?;
         enc.setComputePipelineState(&self.reproject_pipeline);
